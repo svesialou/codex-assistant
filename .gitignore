@@ -1,0 +1,25 @@
+.env
+.coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+*.egg-info/
+*.py[cod]
+
+# Local Codex/Telegram runtime state must never be committed.
+.codex/
+telegram-bot/
+project-index/
+secrets/
+*.log
+*.pid
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# OS/editor noise.
+.DS_Store
+.idea/
+.vscode/

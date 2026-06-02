@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-assistant"
+version = "0.1.0"
+description = "Local Telegram bot for running Codex tasks against local projects."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+codex-telegram-bot = "codex_telegram_bot.bot:main"
+codex-project-index = "codex_telegram_bot.project_index:main"
+
+[tool.setuptools]
+packages = ["codex_telegram_bot"]

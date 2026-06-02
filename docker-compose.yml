@@ -1,0 +1,27 @@
+services:
+  codex-telegram-bot:
+    build:
+      context: .
+      args:
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.135.0}
+    image: codex-assistant:local
+    container_name: codex-telegram-bot
+    command: >
+      bash -lc "python -m codex_telegram_bot --reindex &&
+      exec python -m codex_telegram_bot"
+    init: true
+    restart: unless-stopped
+    user: "${HOST_UID:-1000}:${HOST_GID:-1000}"
+    environment:
+      HOME: /home/codex
+      PYTHONUNBUFFERED: "1"
+      CODEX_TELEGRAM_ENV_FILE: /home/codex/.codex/secrets/telegram.env
+      CODEX_TELEGRAM_PROJECT_DIRS: /home/codex/Projects:/home/codex/MyProjects
+      CODEX_TELEGRAM_INDEX_DIR: /home/codex/.codex/project-index
+      CODEX_TELEGRAM_STATE_DIR: /home/codex/.codex/telegram-bot
+      CODEX_TELEGRAM_CODEX_BIN: codex
+    volumes:
+      - ${CODEX_HOST_HOME}/.codex:/home/codex/.codex
+      - ${CODEX_HOST_HOME}/Projects:/home/codex/Projects
+      - ${CODEX_HOST_HOME}/MyProjects:/home/codex/MyProjects
+    stop_grace_period: 30s
