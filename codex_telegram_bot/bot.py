@@ -382,13 +382,21 @@ class CodexTelegramBot:
         with self._projects_lock:
             projects = load_index(self.config.index_dir)
             if not projects:
-                projects = build_index(self.config.project_roots, self.config.index_dir)
+                projects = build_index(
+                    self.config.project_roots,
+                    self.config.index_dir,
+                    self.config.workspace_root,
+                )
             self.projects = projects
             LOG.info("loaded %d projects", len(projects))
 
     def refresh_index(self) -> int:
         with self._projects_lock:
-            self.projects = build_index(self.config.project_roots, self.config.index_dir)
+            self.projects = build_index(
+                self.config.project_roots,
+                self.config.index_dir,
+                self.config.workspace_root,
+            )
             return len(self.projects)
 
     def configure_telegram_menu(self) -> None:
@@ -2400,7 +2408,11 @@ def main() -> int:
     configure_logging(config.state_dir)
 
     if args.reindex:
-        projects = build_index(config.project_roots, config.index_dir)
+        projects = build_index(
+            config.project_roots,
+            config.index_dir,
+            config.workspace_root,
+        )
         print(f"Indexed {len(projects)} projects into {config.index_dir}")
         return 0
 

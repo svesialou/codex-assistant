@@ -14,8 +14,16 @@ else
 fi
 
 TOOL_DIR="${CODEX_TELEGRAM_BOT_TOOL_DIR:-${CODEX_HOME}/tools/codex_telegram_bot}"
+ENV_FILE="${CODEX_TELEGRAM_ENV_FILE:-${CODEX_HOME}/secrets/telegram.env}"
+
+if [ -f "${ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+fi
+
 ROOTS="${CODEX_TELEGRAM_PROJECT_DIRS:-${HOME}/Projects:${HOME}/MyProjects}"
 OUTPUT="${CODEX_TELEGRAM_INDEX_DIR:-${CODEX_HOME}/project-index}"
+WORKSPACE_ROOT="${CODEX_TELEGRAM_WORKSPACE_ROOT:-${HOME}}"
 
 if [ -d "${TOOL_DIR}/codex_telegram_bot" ]; then
   PYTHONPATH_ROOT="${TOOL_DIR}"
@@ -30,4 +38,5 @@ fi
 PYTHONPATH="${PYTHONPATH_ROOT}${PYTHONPATH:+:${PYTHONPATH}}" \
   python3 -m codex_telegram_bot.project_index \
     --roots "${ROOTS}" \
-    --output "${OUTPUT}"
+    --output "${OUTPUT}" \
+    --workspace-root "${WORKSPACE_ROOT}"

@@ -118,6 +118,7 @@ class Config:
     transcribe_command: str | None
     transcribe_timeout_seconds: int
     env_file: Path
+    workspace_root: Path | None = None
     slack_token: str | None = None
     slack_watch_dms: bool = True
     slack_channel_ids: tuple[str, ...] = ()
@@ -134,13 +135,21 @@ class Config:
         )
 
         run_timeout = int(env.get("CODEX_TELEGRAM_RUN_TIMEOUT_SECONDS", "0"))
+        allowed_chat_ids = parse_csv_ints(chat_ids)
+        allowed_user_ids = parse_csv_ints(
+            env.get("CODEX_TELEGRAM_ALLOWED_USER_IDS")
+            or env.get("CODEX_TELEGRAM_USER_ID")
+        )
+        if not allowed_user_ids:
+            allowed_user_ids = {chat_id for chat_id in allowed_chat_ids if chat_id > 0}
+
         slack_target_chat_ids = parse_csv_ints(env.get("CODEX_SLACK_TELEGRAM_CHAT_IDS"))
         if not slack_target_chat_ids:
             slack_target_chat_ids = parse_csv_ints(chat_ids)
         return cls(
             bot_token=bot_token,
-            allowed_chat_ids=parse_csv_ints(chat_ids),
-            allowed_user_ids=parse_csv_ints(env.get("CODEX_TELEGRAM_ALLOWED_USER_IDS")),
+            allowed_chat_ids=allowed_chat_ids,
+            allowed_user_ids=allowed_user_ids,
             project_roots=parse_path_list(
                 env.get("CODEX_TELEGRAM_PROJECT_DIRS"),
                 [Path("~/Projects"), Path("~/MyProjects")],
@@ -170,6 +179,11 @@ class Config:
                 env.get("CODEX_TELEGRAM_TRANSCRIBE_TIMEOUT_SECONDS", "300")
             ),
             env_file=Path(env["CODEX_TELEGRAM_ENV_FILE"]),
+            workspace_root=Path(
+                os.path.expandvars(
+                    env.get("CODEX_TELEGRAM_WORKSPACE_ROOT", str(Path.home()))
+                )
+            ).expanduser(),
             slack_token=(
                 env.get("CODEX_SLACK_TOKEN")
                 or env.get("CODEX_SLACK_USER_TOKEN")
@@ -208,4 +222,11 @@ class Config:
         if not self.allowed_chat_ids:
             raise ValueError(
                 "CODEX_TELEGRAM_ALLOWED_CHAT_IDS or CODEX_TELEGRAM_CHAT_ID is required."
+            )
+        if (
+            any(chat_id < 0 for chat_id in self.allowed_chat_ids)
+            and not self.allowed_user_ids
+        ):
+            raise ValueError(
+                "CODEX_TELEGRAM_ALLOWED_USER_IDS is required for group chats."
             )

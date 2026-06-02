@@ -4,8 +4,10 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from codex_telegram_bot.config import (
+    Config,
     load_env_file,
     parse_bool,
     parse_csv_ints,
@@ -53,6 +55,54 @@ EMPTY=
         self.assertEqual([str(path) for path in paths], ["/a", "/b"])
         expanded = parse_path_list("$CODEX_TEST_HOME/Projects", [])
         self.assertEqual(str(expanded[0]), "/tmp/codex-test-home/Projects")
+
+    def test_private_chat_defaults_to_same_allowed_user_id(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+                "CODEX_TELEGRAM_WORKSPACE_ROOT": "/workspace",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertEqual(config.allowed_chat_ids, {123})
+        self.assertEqual(config.allowed_user_ids, {123})
+        self.assertEqual(str(config.workspace_root), "/workspace")
+
+    def test_explicit_allowed_user_ids_override_private_default(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+                "CODEX_TELEGRAM_ALLOWED_USER_IDS": "456",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertEqual(config.allowed_chat_ids, {123})
+        self.assertEqual(config.allowed_user_ids, {456})
+
+    def test_group_chat_requires_allowed_user_ids(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "-100123",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        with self.assertRaisesRegex(ValueError, "CODEX_TELEGRAM_ALLOWED_USER_IDS"):
+            config.validate_for_bot()
 
 
 if __name__ == "__main__":

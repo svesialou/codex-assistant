@@ -1,7 +1,7 @@
 # Codex Assistant
 
-Local Telegram long-poll bot for starting Codex tasks in projects under
-`~/Projects` and `~/MyProjects`.
+Local Telegram long-poll bot for starting Codex tasks in local projects.
+Project directories are configured through environment files during install.
 
 The bot itself is Python stdlib-only. Docker is the recommended runtime because
 `restart: unless-stopped` keeps the bot running after crashes and daemon restarts.
@@ -25,18 +25,19 @@ Prerequisites:
 - A configured Codex CLI account in `~/.codex` on the host
 - Telegram bot token and allowed chat id
 
-Clone and install:
+Clone anywhere and install:
 
 ```sh
-git clone git@github.com:kaselrap/codex-assistant.git ~/Projects/codex-assistant
-cd ~/Projects/codex-assistant
+git clone git@github.com:kaselrap/codex-assistant.git ~/src/codex-assistant
+cd ~/src/codex-assistant
 ./scripts/install.sh
 ```
 
-Fill secrets:
+Configure secrets and project roots:
 
 ```sh
 nano ~/.codex/secrets/telegram.env
+nano .env
 ```
 
 Required values:
@@ -46,12 +47,17 @@ CODEX_TELEGRAM_BOT_TOKEN=123456:telegram-token
 CODEX_TELEGRAM_CHAT_ID=123456789
 ```
 
-Optional hardening:
+Access control:
 
 ```sh
 CODEX_TELEGRAM_ALLOWED_CHAT_IDS=123456789
 CODEX_TELEGRAM_ALLOWED_USER_IDS=123456789
 ```
+
+For a private chat, `CODEX_TELEGRAM_CHAT_ID` is enough: the bot uses the same
+positive id as the allowed user id by default. For group chats, set
+`CODEX_TELEGRAM_ALLOWED_USER_IDS` explicitly; otherwise the bot refuses to start
+instead of accepting commands from everyone in the group.
 
 Start through Docker:
 
@@ -67,23 +73,38 @@ when you explicitly want the old background-process mode.
 
 ## Docker Runtime
 
-Compose mounts the host workspace into the container:
+Compose mounts Codex config and one host workspace root into the container:
 
 - `${CODEX_HOST_HOME}/.codex` -> `/home/codex/.codex`
-- `${CODEX_HOST_HOME}/Projects` -> `/home/codex/Projects`
-- `${CODEX_HOST_HOME}/MyProjects` -> `/home/codex/MyProjects`
+- `${CODEX_HOST_WORKSPACE_ROOT}` -> same absolute path inside the container
 
-The generated `.env` file stores only local paths and UID/GID:
+The generated repository-local `.env` file stores only local paths and UID/GID:
 
 ```sh
 CODEX_HOST_HOME=/home/your-user
+CODEX_HOST_WORKSPACE_ROOT=/home/your-user
+CODEX_TELEGRAM_PROJECT_DIRS=/home/your-user/Projects:/home/your-user/MyProjects
 HOST_UID=1000
 HOST_GID=1000
 CODEX_CLI_VERSION=0.135.0
 ```
 
+If your projects live elsewhere, set `CODEX_HOST_WORKSPACE_ROOT` to their common
+parent and `CODEX_TELEGRAM_PROJECT_DIRS` to colon-separated absolute project
+roots under that mounted parent. Example:
+
+```sh
+CODEX_HOST_WORKSPACE_ROOT=/data/work
+CODEX_TELEGRAM_PROJECT_DIRS=/data/work/company:/data/work/personal
+```
+
+For roots that do not share a practical parent, use a broader common parent
+such as `/home/your-user`, or run in process mode on the host.
+
 On container startup, Compose rebuilds the project index with container paths
-before starting the long-poll bot. This avoids stale host paths in Docker mode.
+before starting the long-poll bot. Because the workspace root is mounted to the
+same absolute path, Codex edits the same paths on host and in Docker mode. The
+Telegram `Root` context uses `CODEX_HOST_WORKSPACE_ROOT` in Docker mode.
 
 Useful commands:
 
@@ -120,7 +141,8 @@ PYTHONPATH=. python -m codex_telegram_bot --reindex
 Optional Telegram/Codex settings in `~/.codex/secrets/telegram.env`:
 
 ```sh
-CODEX_TELEGRAM_PROJECT_DIRS="$HOME/Projects:$HOME/MyProjects"
+CODEX_TELEGRAM_PROJECT_DIRS="/home/your-user/Projects:/home/your-user/MyProjects"
+CODEX_TELEGRAM_WORKSPACE_ROOT="/home/your-user"
 CODEX_TELEGRAM_INDEX_DIR="$HOME/.codex/project-index"
 CODEX_TELEGRAM_STATE_DIR="$HOME/.codex/telegram-bot"
 CODEX_TELEGRAM_CODEX_BIN=codex

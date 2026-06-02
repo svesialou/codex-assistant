@@ -16,12 +16,12 @@ services:
       HOME: /home/codex
       PYTHONUNBUFFERED: "1"
       CODEX_TELEGRAM_ENV_FILE: /home/codex/.codex/secrets/telegram.env
-      CODEX_TELEGRAM_PROJECT_DIRS: /home/codex/Projects:/home/codex/MyProjects
+      CODEX_TELEGRAM_PROJECT_DIRS: ${CODEX_TELEGRAM_PROJECT_DIRS}
+      CODEX_TELEGRAM_WORKSPACE_ROOT: ${CODEX_HOST_WORKSPACE_ROOT}
       CODEX_TELEGRAM_INDEX_DIR: /home/codex/.codex/project-index
       CODEX_TELEGRAM_STATE_DIR: /home/codex/.codex/telegram-bot
       CODEX_TELEGRAM_CODEX_BIN: codex
     volumes:
       - ${CODEX_HOST_HOME}/.codex:/home/codex/.codex
-      - ${CODEX_HOST_HOME}/Projects:/home/codex/Projects
-      - ${CODEX_HOST_HOME}/MyProjects:/home/codex/MyProjects
+      - ${CODEX_HOST_WORKSPACE_ROOT}:${CODEX_HOST_WORKSPACE_ROOT}
     stop_grace_period: 30s

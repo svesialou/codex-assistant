@@ -424,13 +424,22 @@ def parse_args() -> argparse.Namespace:
         default="~/.codex/project-index",
         help="Output directory.",
     )
+    parser.add_argument(
+        "--workspace-root",
+        default="~",
+        help="Root context path.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     roots = [Path(item).expanduser() for item in args.roots.split(":") if item]
-    projects = build_index(roots, Path(args.output).expanduser())
+    projects = build_index(
+        roots,
+        Path(args.output).expanduser(),
+        Path(args.workspace_root).expanduser(),
+    )
     print(f"Indexed {len(projects)} projects into {Path(args.output).expanduser()}")
     return 0
 
