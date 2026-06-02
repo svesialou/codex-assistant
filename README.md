@@ -121,19 +121,19 @@ docker compose down
 Run tests:
 
 ```sh
-python -m unittest discover -s tests
+python3 -m unittest discover -s tests
 ```
 
 Run the bot without Docker:
 
 ```sh
-PYTHONPATH=. python -m codex_telegram_bot
+PYTHONPATH=. python3 -m codex_telegram_bot
 ```
 
 Rebuild the project index:
 
 ```sh
-PYTHONPATH=. python -m codex_telegram_bot --reindex
+PYTHONPATH=. python3 -m codex_telegram_bot --reindex
 ```
 
 ## Configuration
@@ -158,6 +158,18 @@ CODEX_TELEGRAM_TRANSCRIBE_TIMEOUT_SECONDS=300
 `CODEX_TELEGRAM_TRANSCRIBE_CMD` is optional. When set, Telegram voice messages
 are downloaded and passed to the command. The command must print the transcript
 to stdout.
+
+Interrupted task recovery:
+
+```sh
+CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS=1
+```
+
+Recovery is enabled by default. On bot startup, stale `planning`, `running`, and
+`agent_running` tasks from allowed chats are queued again. Running executions use
+the saved Codex session id when available and a recovery prompt that asks Codex
+to continue from the current workspace instead of blindly repeating completed
+work.
 
 Optional Slack forwarding:
 

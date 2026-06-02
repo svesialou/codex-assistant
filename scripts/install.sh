@@ -42,6 +42,7 @@ CODEX_TELEGRAM_ALLOWED_USER_IDS=
 # Project roots can be anywhere under CODEX_HOST_WORKSPACE_ROOT in Docker mode.
 CODEX_TELEGRAM_PROJECT_DIRS=${HOME}/Projects:${HOME}/MyProjects
 CODEX_TELEGRAM_WORKSPACE_ROOT=${HOME}
+CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS=1
 ENV
   chmod 600 "${ENV_FILE}"
   echo "created ${ENV_FILE}; fill Telegram token and chat id before starting"

@@ -264,6 +264,83 @@ class BotUiTest(unittest.TestCase):
             ],
         )
 
+    def test_recover_interrupted_tasks_queues_stale_running_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[str] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+
+            def fake_send(
+                chat_id: int,
+                text: str,
+                reply_markup: dict | None = None,
+            ) -> int:
+                sent.append(text)
+                return len(sent)
+
+            bot.send = fake_send
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="finish task",
+                kind="direct_task",
+            )
+            task.phase = "running"
+            task.pid = 999999
+            task.pid_start_time = "old-start-time"
+            task.run_log_path = str(bot.store.task_dir(task.id) / "run.log")
+            Path(task.run_log_path).write_text(
+                "OpenAI Codex\n"
+                "session id: 019e7842-d41f-72b3-9394-911a9c490cb4\n",
+                encoding="utf-8",
+            )
+            bot.store.save_task(task)
+
+            bot.recover_interrupted_tasks(pid_alive=lambda pid: False)
+
+            loaded = bot.store.load_task(task.id)
+
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.pid)
+        self.assertEqual(loaded.pid_start_time, "")
+        self.assertEqual(
+            loaded.codex_session_id,
+            "019e7842-d41f-72b3-9394-911a9c490cb4",
+        )
+        self.assertEqual(spawned[0][0].__name__, "execute_task")
+        self.assertEqual(spawned[0][1], (task.id, 1, True))
+        self.assertIn("Восстанавливаю задачу", sent[0])
+
+    def test_recover_interrupted_tasks_skips_live_recorded_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: 1
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="finish task",
+            )
+            task.phase = "planning"
+            task.pid = 123
+            bot.store.save_task(task)
+
+            bot.recover_interrupted_tasks(pid_alive=lambda pid: pid == 123)
+
+        self.assertEqual(spawned, [])
+
     def test_file_attachment_after_planning_is_stored_on_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(tmp)

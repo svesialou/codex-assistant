@@ -49,6 +49,38 @@ class TaskStoreTest(unittest.TestCase):
         self.assertEqual(loaded.prompt_draft_parts, ["part 1", "part 2"])
         self.assertEqual([item.chat_id for item in states], [10])
 
+    def test_tasks_filters_by_chat_phase_and_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp))
+            first = store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="do work",
+            )
+            first.phase = "running"
+            store.save_task(first)
+            second = store.create_task(
+                chat_id=11,
+                user_id=21,
+                project_slug="other",
+                project_name="other",
+                project_path="/tmp/other",
+                prompt="other work",
+            )
+            second.phase = "planned"
+            store.save_task(second)
+
+            tasks = store.tasks(
+                phases={"running"},
+                chat_ids={10},
+                project_slug="demo",
+            )
+
+        self.assertEqual([task.id for task in tasks], [first.id])
+
     def test_add_attachment_persists_on_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp))

@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import os
 import re
+import secrets
 import signal
 import subprocess
 from pathlib import Path
 
 from .config import Config
 from .project_index import ProjectInfo
-from .task_store import TaskRecord, TaskStore
+from .task_store import TaskRecord, TaskStore, process_start_time
 
 SESSION_ID_RE = re.compile(r"(?im)^session id:\s*([^\s]+)")
 SESSION_ID_READ_BYTES = 64 * 1024
@@ -48,6 +49,22 @@ def truncate_for_prompt(text: str, max_chars: int = 2000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "\n..."
+
+
+def read_text_tail(path: str | Path, max_chars: int = 4000) -> str:
+    if not path:
+        return ""
+
+    file_path = Path(path)
+    try:
+        with file_path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            handle.seek(max(0, size - max_chars * 4))
+            text = handle.read().decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+    return text[-max_chars:].lstrip()
 
 
 def extract_session_id(log_path: Path) -> str:
@@ -172,6 +189,68 @@ Planning response already shown to user:
 """
 
 
+def interrupted_execution_prompt(
+    task: TaskRecord,
+    context: str,
+    previous_log_tail: str,
+    previous_final: str,
+) -> str:
+    clarifications = "\n".join(f"- {item}" for item in task.clarifications) or "- none"
+    attachments = attachment_context(task)
+    plan = task.plan_text.strip() or "No prior plan was recorded."
+    log_tail = previous_log_tail.strip() or "-"
+    final_text = previous_final.strip() or "-"
+    return f"""The previous Codex process for this Telegram task was interrupted by a bot or container restart.
+
+Continue from the current workspace state. First inspect git status, relevant files, existing logs, and the existing final answer if useful.
+Do not assume that no work was done before the restart. Do not repeat already completed changes.
+Do not revert unrelated changes or user changes. If the requested work is already complete, verify it and produce the final response.
+Run relevant checks where practical. Final answer must be in Russian and use:
+
+- Changed:
+- Why:
+- Verified:
+- Risks / Notes:
+
+Project:
+- name: {task.project_name}
+- path: {task.project_path}
+- slug: {task.project_slug}
+
+Project agent context:
+{context}
+
+Telegram task state:
+- id: {task.id}
+- kind: {task.kind}
+- parent task id: {task.parent_task_id or "-"}
+- recovery attempt: {task.recovery_attempts}
+- previous run log path: {task.run_log_path or "-"}
+- previous final answer path: {task.final_path or "-"}
+- Codex session id available: {"yes" if task.codex_session_id else "no"}
+
+Original task:
+{task.prompt}
+
+Clarifications:
+{clarifications}
+
+Attached files:
+{attachments}
+
+Treat attached files as user-provided local inputs. Use their paths only when needed, do not log file contents or secrets.
+
+Planning response already shown to user:
+{plan}
+
+Previous run log tail:
+{log_tail}
+
+Existing final answer, if any:
+{final_text}
+"""
+
+
 def continuation_prompt(
     task: TaskRecord,
     context: str,
@@ -243,9 +322,15 @@ Answer directly and concisely. If the message is a task request, clarify the lik
 
 
 class CodexRunner:
-    def __init__(self, config: Config, store: TaskStore) -> None:
+    def __init__(
+        self,
+        config: Config,
+        store: TaskStore,
+        runtime_id: str | None = None,
+    ) -> None:
         self.config = config
         self.store = store
+        self.runtime_id = runtime_id or secrets.token_hex(8)
 
     def _command_env(self) -> dict[str, str]:
         env = os.environ.copy()
@@ -286,8 +371,25 @@ class CodexRunner:
         command.extend([session_id, "-"])
         return command
 
+    def _mark_process_started(
+        self,
+        task: TaskRecord,
+        process: subprocess.Popen[bytes],
+    ) -> None:
+        task.pid = process.pid
+        task.pid_start_time = process_start_time(process.pid)
+        task.runtime_id = self.runtime_id
+        self.store.save_task(task)
+
+    def _mark_process_finished(self, task: TaskRecord) -> None:
+        task.pid = None
+        task.pid_start_time = ""
+        self.store.save_task(task)
+
     def run_planning(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
         task.phase = "planning"
+        task.returncode = None
+        task.error = ""
         task_dir = self.store.task_dir(task.id)
         plan_path = task_dir / "plan.md"
         log_path = task_dir / "plan.log"
@@ -311,8 +413,7 @@ class CodexRunner:
                 start_new_session=True,
                 env=self._command_env(),
             )
-            task.pid = process.pid
-            self.store.save_task(task)
+            self._mark_process_started(task, process)
             try:
                 returncode = process.wait(timeout=self.config.plan_timeout_seconds)
             except subprocess.TimeoutExpired:
@@ -329,8 +430,7 @@ class CodexRunner:
                     task.error = f"Planning failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        task.pid = None
-        self.store.save_task(task)
+        self._mark_process_finished(task)
         return task
 
     def run_execution(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
@@ -362,8 +462,7 @@ class CodexRunner:
                 start_new_session=True,
                 env=self._command_env(),
             )
-            task.pid = process.pid
-            self.store.save_task(task)
+            self._mark_process_started(task, process)
             try:
                 returncode = process.wait(timeout=self.config.run_timeout_seconds)
             except subprocess.TimeoutExpired:
@@ -379,8 +478,76 @@ class CodexRunner:
                     task.error = f"Execution failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        task.pid = None
+        self._mark_process_finished(task)
+        return task
+
+    def run_recovery_execution(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+    ) -> TaskRecord:
+        task.phase = "running"
+        task.returncode = None
+        task.error = ""
+        task.recovery_attempts += 1
+        task_dir = self.store.task_dir(task.id)
+        final_path = Path(task.final_path) if task.final_path else task_dir / "final.md"
+        log_path = Path(task.run_log_path) if task.run_log_path else task_dir / "run.log"
+        prompt_path = task_dir / "recovery-prompt.md"
+        previous_log_tail = read_text_tail(log_path)
+        previous_final = read_text_tail(final_path)
+        task.final_path = str(final_path)
+        task.run_log_path = str(log_path)
+        task.prompt_path = str(prompt_path)
+        if not task.codex_session_id:
+            task.codex_session_id = extract_session_id(log_path)
         self.store.save_task(task)
+
+        context = read_context(self.config.index_dir, project.slug)
+        prompt_path.write_text(
+            interrupted_execution_prompt(
+                task,
+                context,
+                previous_log_tail,
+                previous_final,
+            ),
+            encoding="utf-8",
+        )
+
+        resume_session_id = task.codex_session_id
+        if resume_session_id:
+            command = self._resume_command(resume_session_id, final_path)
+        else:
+            command = self._base_command(task.project_path, final_path)
+            command.extend(["-s", "danger-full-access", "-"])
+
+        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=task.project_path,
+                start_new_session=True,
+                env=self._command_env(),
+            )
+            self._mark_process_started(task, process)
+            try:
+                returncode = process.wait(timeout=self.config.run_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                returncode = wait_after_stop(process)
+                task.phase = "failed"
+                task.error = "Recovered execution timed out."
+            else:
+                task.returncode = returncode
+                if returncode == 0:
+                    task.phase = "completed"
+                else:
+                    task.phase = "failed"
+                    task.error = f"Recovered execution failed with exit code {returncode}."
+
+        task.codex_session_id = extract_session_id(log_path) or resume_session_id
+        self._mark_process_finished(task)
         return task
 
     def run_followup_execution(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
@@ -422,8 +589,7 @@ class CodexRunner:
                 start_new_session=True,
                 env=self._command_env(),
             )
-            task.pid = process.pid
-            self.store.save_task(task)
+            self._mark_process_started(task, process)
             try:
                 returncode = process.wait(timeout=self.config.run_timeout_seconds)
             except subprocess.TimeoutExpired:
@@ -439,8 +605,7 @@ class CodexRunner:
                     task.error = f"Continuation failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or resume_session_id
-        task.pid = None
-        self.store.save_task(task)
+        self._mark_process_finished(task)
         return task
 
     def run_agent_chat(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
@@ -472,8 +637,7 @@ class CodexRunner:
                 start_new_session=True,
                 env=self._command_env(),
             )
-            task.pid = process.pid
-            self.store.save_task(task)
+            self._mark_process_started(task, process)
             try:
                 returncode = process.wait(timeout=self.config.plan_timeout_seconds)
             except subprocess.TimeoutExpired:
@@ -489,6 +653,5 @@ class CodexRunner:
                     task.error = f"Agent response failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        task.pid = None
-        self.store.save_task(task)
+        self._mark_process_finished(task)
         return task

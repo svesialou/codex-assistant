@@ -43,8 +43,11 @@ class TaskRecord:
     final_path: str = ""
     prompt_path: str = ""
     pid: int | None = None
+    pid_start_time: str = ""
+    runtime_id: str = ""
     returncode: int | None = None
     error: str = ""
+    recovery_attempts: int = 0
     created_at: str = field(default_factory=now_iso)
     updated_at: str = field(default_factory=now_iso)
 
@@ -159,13 +162,27 @@ class TaskStore:
         phases: set[str] | None = None,
         project_slug: str | None = None,
     ) -> list[TaskRecord]:
+        return self.tasks(
+            limit=limit,
+            phases=phases,
+            chat_ids={chat_id},
+            project_slug=project_slug,
+        )
+
+    def tasks(
+        self,
+        limit: int | None = None,
+        phases: set[str] | None = None,
+        chat_ids: set[int] | None = None,
+        project_slug: str | None = None,
+    ) -> list[TaskRecord]:
         tasks: list[TaskRecord] = []
         for path in self.tasks_dir.glob("*/task.json"):
             try:
                 task = TaskRecord.from_dict(json.loads(path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError, TypeError):
                 continue
-            if task.chat_id != chat_id:
+            if chat_ids is not None and task.chat_id not in chat_ids:
                 continue
             if phases is not None and task.phase not in phases:
                 continue
@@ -173,7 +190,7 @@ class TaskStore:
                 continue
             tasks.append(task)
         tasks.sort(key=lambda item: item.updated_at, reverse=True)
-        return tasks[:limit]
+        return tasks[:limit] if limit is not None else tasks
 
     def chat_state_path(self, chat_id: int) -> Path:
         return self.state_dir / "chats" / f"{chat_id}.json"
@@ -238,3 +255,30 @@ def is_process_alive(pid: int | None) -> bool:
     except OSError:
         return False
     return True
+
+
+def process_start_time(pid: int | None) -> str:
+    if pid is None:
+        return ""
+
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+    try:
+        fields = stat.rsplit(")", 1)[1].strip().split()
+        return fields[19]
+    except (IndexError, ValueError):
+        return ""
+
+
+def is_recorded_process_alive(
+    task: TaskRecord,
+    pid_alive: Any = is_process_alive,
+) -> bool:
+    if task.pid is None:
+        return False
+    if task.pid_start_time:
+        return process_start_time(task.pid) == task.pid_start_time
+    return bool(pid_alive(task.pid))

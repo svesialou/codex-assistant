@@ -9,7 +9,9 @@ from codex_telegram_bot.codex_runner import (
     continuation_prompt,
     execution_prompt,
     extract_session_id,
+    interrupted_execution_prompt,
     planning_prompt,
+    read_text_tail,
 )
 from codex_telegram_bot.config import Config
 from codex_telegram_bot.task_store import TaskRecord, TaskStore
@@ -165,6 +167,45 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn("Parent task:", prompt)
         self.assertIn("initial task", prompt)
         self.assertIn("continue with tests", prompt)
+
+    def test_interrupted_execution_prompt_includes_recovery_context(self) -> None:
+        task = TaskRecord(
+            id="task-1",
+            chat_id=10,
+            user_id=20,
+            project_slug="demo",
+            project_name="demo",
+            project_path="/tmp/demo",
+            prompt="finish implementation",
+            phase="running",
+            run_log_path="/tmp/task/run.log",
+            final_path="/tmp/task/final.md",
+            codex_session_id="019e7842-d41f-72b3-9394-911a9c490cb4",
+            recovery_attempts=1,
+        )
+        task.plan_text = "Change the smallest set of files."
+
+        prompt = interrupted_execution_prompt(
+            task,
+            "Project context",
+            "edited file A",
+            "partial final",
+        )
+
+        self.assertIn("interrupted by a bot or container restart", prompt)
+        self.assertIn("Do not repeat already completed changes", prompt)
+        self.assertIn("/tmp/task/run.log", prompt)
+        self.assertIn("partial final", prompt)
+        self.assertIn("Changed:", prompt)
+
+    def test_read_text_tail_limits_large_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "run.log"
+            path.write_text("a" * 100 + "tail", encoding="utf-8")
+
+            tail = read_text_tail(path, max_chars=8)
+
+        self.assertEqual(tail, "aaaatail")
 
 
 if __name__ == "__main__":

@@ -72,6 +72,22 @@ EMPTY=
         self.assertEqual(config.allowed_chat_ids, {123})
         self.assertEqual(config.allowed_user_ids, {123})
         self.assertEqual(str(config.workspace_root), "/workspace")
+        self.assertTrue(config.recover_interrupted_tasks)
+
+    def test_interrupted_task_recovery_can_be_disabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+                "CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS": "0",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertFalse(config.recover_interrupted_tasks)
 
     def test_explicit_allowed_user_ids_override_private_default(self) -> None:
         with patch.dict(

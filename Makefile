@@ -1,7 +1,9 @@
 .PHONY: test docker-config docker-build docker-up docker-down docker-logs install reindex
 
+PYTHON ?= python3
+
 test:
-	python -m unittest discover -s tests
+	$(PYTHON) -m unittest discover -s tests
 
 docker-config:
 	docker compose config
@@ -22,4 +24,4 @@ install:
 	./scripts/install.sh
 
 reindex:
-	python -m codex_telegram_bot --reindex
+	$(PYTHON) -m codex_telegram_bot --reindex

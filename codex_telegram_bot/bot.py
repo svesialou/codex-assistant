@@ -34,6 +34,7 @@ from .task_store import (
     ChatState,
     TaskRecord,
     TaskStore,
+    is_recorded_process_alive,
     is_process_alive,
     terminate_process_group,
 )
@@ -325,7 +326,7 @@ def process_summary(
     active: list[TaskRecord] = []
     stale_count = 0
     for task in tasks:
-        if task.pid and pid_alive(task.pid):
+        if is_recorded_process_alive(task, pid_alive):
             active.append(task)
         else:
             stale_count += 1
@@ -1079,6 +1080,65 @@ class CodexTelegramBot:
                     state.chat_id,
                     state.prompt_draft_version,
                 )
+
+    def recover_interrupted_tasks(
+        self,
+        pid_alive: Callable[[int | None], bool] = is_process_alive,
+    ) -> None:
+        if not self.config.recover_interrupted_tasks:
+            LOG.info("interrupted task recovery is disabled")
+            return
+
+        tasks = self.store.tasks(
+            phases=PROCESS_PHASES,
+            chat_ids=self.config.allowed_chat_ids,
+        )
+        queued = 0
+        for task in tasks:
+            if is_recorded_process_alive(task, pid_alive):
+                continue
+
+            previous_phase = task.phase
+            task.pid = None
+            task.pid_start_time = ""
+            if not task.codex_session_id:
+                for log_path in (task.run_log_path, task.plan_log_path):
+                    if log_path:
+                        task.codex_session_id = extract_session_id(Path(log_path))
+                        if task.codex_session_id:
+                            break
+
+            project = self.find_project(task.project_slug)
+            if project is None:
+                task.phase = "failed"
+                task.error = (
+                    "Interrupted task could not be recovered because project "
+                    "disappeared from index."
+                )
+                task.recovery_attempts += 1
+                self.store.save_task(task)
+                self.send(task.chat_id, f"Task {task.id} failed: {task.error}")
+                continue
+
+            if previous_phase != "running":
+                task.recovery_attempts += 1
+            task.error = "Interrupted by bot restart; recovery queued."
+            self.store.save_task(task)
+            status_message_id = self.send_codex_status(
+                task,
+                previous_phase,
+                f"Восстанавливаю задачу {task.id} после рестарта бота.",
+            )
+            if previous_phase == "planning":
+                self.spawn(self.plan_task, task.id, status_message_id)
+            elif previous_phase == "agent_running":
+                self.spawn(self.run_agent_chat, task.id, status_message_id)
+            elif previous_phase == "running":
+                self.spawn(self.execute_task, task.id, status_message_id, True)
+            queued += 1
+
+        if queued:
+            LOG.info("queued %d interrupted task recoveries", queued)
 
     def start_slack_watcher(self) -> None:
         if self.slack_watcher is None:
@@ -2132,7 +2192,12 @@ class CodexTelegramBot:
         )
         self.spawn(self.execute_task, task.id, status_message_id)
 
-    def execute_task(self, task_id: str, status_message_id: int | None = None) -> None:
+    def execute_task(
+        self,
+        task_id: str,
+        status_message_id: int | None = None,
+        recover: bool = False,
+    ) -> None:
         task = self.store.load_task(task_id)
         if task is None:
             return
@@ -2155,7 +2220,10 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_execution(task, project)
+        if recover:
+            task = self.runner.run_recovery_execution(task, project)
+        else:
+            task = self.runner.run_execution(task, project)
         self.finish_codex_status(status, task)
         final = ""
         if task.final_path and Path(task.final_path).exists():
@@ -2363,6 +2431,7 @@ class CodexTelegramBot:
         self.load_or_build_index()
         self.configure_telegram_menu()
         self.send_startup_message()
+        self.recover_interrupted_tasks()
         self.resume_prompt_drafts()
         self.start_slack_watcher()
 

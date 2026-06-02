@@ -118,6 +118,7 @@ class Config:
     transcribe_command: str | None
     transcribe_timeout_seconds: int
     env_file: Path
+    recover_interrupted_tasks: bool = True
     workspace_root: Path | None = None
     slack_token: str | None = None
     slack_watch_dms: bool = True
@@ -179,6 +180,10 @@ class Config:
                 env.get("CODEX_TELEGRAM_TRANSCRIBE_TIMEOUT_SECONDS", "300")
             ),
             env_file=Path(env["CODEX_TELEGRAM_ENV_FILE"]),
+            recover_interrupted_tasks=parse_bool(
+                env.get("CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS"),
+                True,
+            ),
             workspace_root=Path(
                 os.path.expandvars(
                     env.get("CODEX_TELEGRAM_WORKSPACE_ROOT", str(Path.home()))
