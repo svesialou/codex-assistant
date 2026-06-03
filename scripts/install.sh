@@ -98,4 +98,4 @@ fi
 
 echo "installed codex assistant into ${CODEX_HOME}"
 echo "run: ${SCRIPTS_DIR}/codex-telegram-bot-control.sh restart"
-echo "autostart: ${SCRIPTS_DIR}/codex-telegram-bot-control.sh enable"
+echo "autostart + watchdog: ${SCRIPTS_DIR}/codex-telegram-bot-control.sh enable"

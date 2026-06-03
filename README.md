@@ -68,11 +68,30 @@ Start the host daemon:
 ```
 
 `restart` prefers `systemd --user` and automatically installs
-`codex-telegram-bot.service` with `Restart=on-failure`. If user systemd is not
+`codex-telegram-bot.service` with `Restart=always`. If user systemd is not
 available, the control script starts `codex-telegram-bot-supervisor.sh` in the
 background; it restarts the bot after crashes. Use
 `~/.codex/scripts/codex-telegram-bot-control.sh enable` to enable user autostart
 on systems with `systemd --user`.
+
+On systems with `systemd --user`, `enable` also installs and starts
+`codex-telegram-bot-watchdog.timer`. The timer runs once per minute and starts
+the bot if the service is inactive or failed. This covers clean stops that are
+not treated as failures by systemd. If `restart` is invoked from a Codex task
+owned by the bot service, the control script schedules a deferred restart in a
+separate transient user unit so the current Codex process can finish before the
+bot service is restarted.
+
+Useful host daemon commands:
+
+```sh
+~/.codex/scripts/codex-telegram-bot-control.sh enable
+~/.codex/scripts/codex-telegram-bot-control.sh watchdog-status
+~/.codex/scripts/codex-telegram-bot-control.sh watchdog-check
+~/.codex/scripts/codex-telegram-bot-control.sh disable
+```
+
+`disable` stops and disables both the bot service and the watchdog timer.
 
 Runtime modes:
 

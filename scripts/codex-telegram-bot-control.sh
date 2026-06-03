@@ -17,11 +17,17 @@ BOT_LOG_FILE="${LOG_DIR}/bot.log"
 RUNNER="${CODEX_HOME}/scripts/codex-telegram-bot.sh"
 SUPERVISOR="${CODEX_HOME}/scripts/codex-telegram-bot-supervisor.sh"
 SERVICE_NAME="codex-telegram-bot.service"
+SERVICE_BASE="${SERVICE_NAME%.service}"
+WATCHDOG_SERVICE_NAME="${SERVICE_BASE}-watchdog.service"
+WATCHDOG_TIMER_NAME="${SERVICE_BASE}-watchdog.timer"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 SERVICE_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}"
+WATCHDOG_SERVICE_FILE="${SYSTEMD_USER_DIR}/${WATCHDOG_SERVICE_NAME}"
+WATCHDOG_TIMER_FILE="${SYSTEMD_USER_DIR}/${WATCHDOG_TIMER_NAME}"
 REPO_FILE="${CODEX_ASSISTANT_REPO_FILE:-${CODEX_HOME}/codex-assistant.repo}"
 DEFAULT_REPO="${HOME}/Projects/codex-assistant"
 RUN_MODE="${CODEX_TELEGRAM_RUN_MODE:-auto}"
+DEFERRED_RESTART_SECONDS="${CODEX_TELEGRAM_DEFERRED_RESTART_SECONDS:-15}"
 
 if [ -n "${CODEX_ASSISTANT_REPO:-}" ]; then
   REPO_DIR="${CODEX_ASSISTANT_REPO}"
@@ -125,6 +131,14 @@ service_known() {
   systemd_available && systemctl --user cat "${SERVICE_NAME}" >/dev/null 2>&1
 }
 
+watchdog_known() {
+  systemd_available && systemctl --user cat "${WATCHDOG_TIMER_NAME}" >/dev/null 2>&1
+}
+
+inside_service_cgroup() {
+  [ -r "/proc/$$/cgroup" ] && grep -Fq "/${SERVICE_NAME}" "/proc/$$/cgroup"
+}
+
 write_service_file() {
   if ! systemd_available; then
     echo "systemd --user is not available in this session" >&2
@@ -142,7 +156,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h
 ExecStart=%h/.codex/scripts/codex-telegram-bot.sh
-Restart=on-failure
+Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
 Environment=CODEX_TELEGRAM_RUN_MODE=systemd
@@ -152,6 +166,67 @@ WantedBy=default.target
 SERVICE
   systemctl --user daemon-reload
   echo "installed ${SERVICE_FILE}"
+}
+
+write_watchdog_files() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  write_service_file >/dev/null
+  cat >"${WATCHDOG_SERVICE_FILE}" <<SERVICE
+[Unit]
+Description=Codex Telegram Bot watchdog check
+
+[Service]
+Type=oneshot
+ExecStart=%h/.codex/scripts/codex-telegram-bot-control.sh watchdog-check
+Environment=PYTHONUNBUFFERED=1
+Environment=CODEX_TELEGRAM_RUN_MODE=systemd
+SERVICE
+
+  cat >"${WATCHDOG_TIMER_FILE}" <<TIMER
+[Unit]
+Description=Check Codex Telegram Bot every minute
+
+[Timer]
+OnStartupSec=30s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=${WATCHDOG_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  systemctl --user daemon-reload
+  echo "installed ${WATCHDOG_SERVICE_FILE}"
+  echo "installed ${WATCHDOG_TIMER_FILE}"
+}
+
+schedule_deferred_systemd_restart() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  local unit_name
+  unit_name="${SERVICE_BASE}-deferred-restart-$(date +%s)-$$.service"
+
+  if command -v systemd-run >/dev/null 2>&1; then
+    systemd-run --user \
+      --unit="${unit_name}" \
+      --description="Deferred Codex Telegram Bot restart" \
+      --on-active="${DEFERRED_RESTART_SECONDS}s" \
+      /bin/bash -lc "systemctl --user restart '${SERVICE_NAME}'"
+  else
+    nohup /bin/bash -lc \
+      "sleep '${DEFERRED_RESTART_SECONDS}'; systemctl --user restart '${SERVICE_NAME}' --no-block" \
+      >>"${LOG_FILE}" 2>&1 &
+  fi
+
+  echo "scheduled deferred restart for ${SERVICE_NAME} in ${DEFERRED_RESTART_SECONDS}s"
 }
 
 systemd_start() {
@@ -278,6 +353,10 @@ restart() {
     docker_restart
     return
   fi
+  if [ "${CODEX_TELEGRAM_DEFER_SELF_RESTART:-1}" != "0" ] && service_known && inside_service_cgroup; then
+    schedule_deferred_systemd_restart
+    return
+  fi
   stop
   start
 }
@@ -317,6 +396,80 @@ install_service() {
   write_service_file
 }
 
+install_watchdog() {
+  write_watchdog_files
+}
+
+enable_watchdog() {
+  write_watchdog_files
+  systemctl --user enable --now "${WATCHDOG_TIMER_NAME}"
+  echo "enabled ${WATCHDOG_TIMER_NAME}"
+}
+
+disable_watchdog() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  systemctl --user disable --now "${WATCHDOG_TIMER_NAME}" 2>/dev/null || true
+  systemctl --user stop "${WATCHDOG_SERVICE_NAME}" 2>/dev/null || true
+  systemctl --user daemon-reload
+  echo "disabled ${WATCHDOG_TIMER_NAME}"
+}
+
+watchdog_check() {
+  if docker_mode; then
+    if docker_status >/dev/null 2>&1; then
+      echo "codex telegram bot docker service is running"
+    else
+      echo "$(date -Is) codex telegram bot docker service is not running; starting"
+      docker_start
+    fi
+    return
+  fi
+
+  if ! systemd_available; then
+    if is_running; then
+      echo "codex telegram bot daemon is running: $(cat "${PID_FILE}")"
+    else
+      echo "$(date -Is) codex telegram bot daemon is not running; starting"
+      supervisor_start
+    fi
+    return
+  fi
+
+  if ! service_known; then
+    write_service_file
+  fi
+
+  if systemctl --user is-active --quiet "${SERVICE_NAME}"; then
+    echo "codex telegram bot service is running"
+    return
+  fi
+
+  echo "$(date -Is) ${SERVICE_NAME} is not active; starting"
+  systemctl --user reset-failed "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  stop_docker_if_present
+  systemctl --user start "${SERVICE_NAME}"
+}
+
+watchdog_status() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  if watchdog_known; then
+    systemctl --user --no-pager --full status "${WATCHDOG_TIMER_NAME}"
+    systemctl --user --no-pager --full status "${WATCHDOG_SERVICE_NAME}" || true
+    systemctl --user list-timers --all "${WATCHDOG_TIMER_NAME}" --no-pager
+  else
+    echo "codex telegram bot watchdog is not installed"
+    return 1
+  fi
+}
+
 enable_service() {
   if docker_mode; then
     docker_start
@@ -325,7 +478,8 @@ enable_service() {
   fi
   write_service_file
   systemctl --user enable --now "${SERVICE_NAME}"
-  echo "enabled and started ${SERVICE_NAME} for user autostart"
+  enable_watchdog
+  echo "enabled and started ${SERVICE_NAME} with watchdog timer"
 }
 
 disable_service() {
@@ -339,9 +493,11 @@ disable_service() {
     return 1
   fi
 
+  systemctl --user disable --now "${WATCHDOG_TIMER_NAME}" 2>/dev/null || true
+  systemctl --user stop "${WATCHDOG_SERVICE_NAME}" 2>/dev/null || true
   systemctl --user disable --now "${SERVICE_NAME}" 2>/dev/null || true
   systemctl --user daemon-reload
-  echo "disabled ${SERVICE_NAME}"
+  echo "disabled ${SERVICE_NAME} and ${WATCHDOG_TIMER_NAME}"
 }
 
 case "${1:-status}" in
@@ -363,6 +519,21 @@ case "${1:-status}" in
   install)
     install_service
     ;;
+  watchdog-install)
+    install_watchdog
+    ;;
+  watchdog-enable)
+    enable_watchdog
+    ;;
+  watchdog-disable)
+    disable_watchdog
+    ;;
+  watchdog-check)
+    watchdog_check
+    ;;
+  watchdog-status)
+    watchdog_status
+    ;;
   enable|autostart)
     enable_service
     ;;
@@ -379,7 +550,7 @@ case "${1:-status}" in
     docker_log "${2:-80}"
     ;;
   *)
-    echo "Usage: $0 start|stop|restart|status|log [lines]|install|enable|autostart|disable|systemd-status|docker-status|docker-logs [lines]" >&2
+    echo "Usage: $0 start|stop|restart|status|log [lines]|install|enable|autostart|disable|watchdog-install|watchdog-enable|watchdog-disable|watchdog-check|watchdog-status|systemd-status|docker-status|docker-logs [lines]" >&2
     exit 2
     ;;
 esac
