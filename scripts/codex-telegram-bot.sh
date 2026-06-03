@@ -2,8 +2,14 @@
 set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+DEV_ENV="${CODEX_DEV_ENV_FILE:-${CODEX_HOME}/scripts/dev-env.sh}"
 REPO_FILE="${CODEX_ASSISTANT_REPO_FILE:-${CODEX_HOME}/codex-assistant.repo}"
 DEFAULT_REPO="${HOME}/Projects/codex-assistant"
+
+if [ -r "${DEV_ENV}" ]; then
+  # shellcheck disable=SC1090
+  source "${DEV_ENV}"
+fi
 
 if [ -n "${CODEX_ASSISTANT_REPO:-}" ]; then
   REPO_DIR="${CODEX_ASSISTANT_REPO}"

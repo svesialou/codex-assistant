@@ -22,11 +22,13 @@ cp "${REPO_DIR}/scripts/codex-telegram-bot.sh" "${SCRIPTS_DIR}/codex-telegram-bo
 cp "${REPO_DIR}/scripts/codex-telegram-bot-supervisor.sh" "${SCRIPTS_DIR}/codex-telegram-bot-supervisor.sh"
 cp "${REPO_DIR}/scripts/codex-project-index.sh" "${SCRIPTS_DIR}/codex-project-index.sh"
 cp "${REPO_DIR}/scripts/codex-telegram-bot-control.sh" "${SCRIPTS_DIR}/codex-telegram-bot-control.sh"
+cp "${REPO_DIR}/scripts/dev-env.sh" "${SCRIPTS_DIR}/dev-env.sh"
 chmod +x \
   "${SCRIPTS_DIR}/codex-telegram-bot.sh" \
   "${SCRIPTS_DIR}/codex-telegram-bot-supervisor.sh" \
   "${SCRIPTS_DIR}/codex-project-index.sh" \
-  "${SCRIPTS_DIR}/codex-telegram-bot-control.sh"
+  "${SCRIPTS_DIR}/codex-telegram-bot-control.sh" \
+  "${SCRIPTS_DIR}/dev-env.sh"
 
 printf '%s\n' "${REPO_DIR}" >"${CODEX_HOME}/codex-assistant.repo"
 
