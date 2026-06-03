@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import codex_telegram_bot.bot as bot_module
 from codex_telegram_bot.bot import (
     BOT_COMMANDS,
     CodexTelegramBot,
@@ -340,6 +341,45 @@ class BotUiTest(unittest.TestCase):
             bot.recover_interrupted_tasks(pid_alive=lambda pid: pid == 123)
 
         self.assertEqual(spawned, [])
+
+    def test_recover_interrupted_tasks_recovers_live_process_from_previous_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            terminated: list[int | None] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            sent: list[str] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text) or 1
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="finish task",
+            )
+            task.phase = "running"
+            task.pid = 123
+            task.runtime_id = "previous-runtime"
+            bot.store.save_task(task)
+
+            original_terminate = bot_module.terminate_process_group
+            bot_module.terminate_process_group = terminated.append
+            try:
+                bot.recover_interrupted_tasks(pid_alive=lambda pid: pid == 123)
+            finally:
+                bot_module.terminate_process_group = original_terminate
+
+            loaded = bot.store.load_task(task.id)
+
+        self.assertEqual(terminated, [123])
+        self.assertIsNotNone(loaded)
+        self.assertIsNone(loaded.pid)
+        self.assertEqual(spawned[0][0].__name__, "execute_task")
+        self.assertEqual(spawned[0][1], (task.id, 1, True))
+        self.assertIn("Восстанавливаю задачу", sent[0])
 
     def test_file_attachment_after_planning_is_stored_on_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

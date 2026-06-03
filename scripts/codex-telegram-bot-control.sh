@@ -2,12 +2,20 @@
 set -euo pipefail
 
 CODEX_HOME="${CODEX_HOME:-${HOME}/.codex}"
+ENV_FILE="${CODEX_TELEGRAM_ENV_FILE:-${CODEX_HOME}/secrets/telegram.env}"
+
+if [ -f "${ENV_FILE}" ]; then
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+fi
+
 STATE_DIR="${CODEX_TELEGRAM_STATE_DIR:-${CODEX_HOME}/telegram-bot}"
 PID_FILE="${STATE_DIR}/bot.pid"
 LOG_DIR="${STATE_DIR}/logs"
 LOG_FILE="${LOG_DIR}/service.log"
 BOT_LOG_FILE="${LOG_DIR}/bot.log"
 RUNNER="${CODEX_HOME}/scripts/codex-telegram-bot.sh"
+SUPERVISOR="${CODEX_HOME}/scripts/codex-telegram-bot-supervisor.sh"
 SERVICE_NAME="codex-telegram-bot.service"
 SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 SERVICE_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}"
@@ -43,14 +51,11 @@ docker_available() {
 
 docker_mode() {
   case "${RUN_MODE}" in
-    docker)
+    docker|compose)
       return 0
       ;;
-    process|legacy|systemd)
+    auto|host|systemd|supervisor|process|legacy)
       return 1
-      ;;
-    auto)
-      [ -f "${COMPOSE_FILE}" ] && docker_available
       ;;
     *)
       echo "Unknown CODEX_TELEGRAM_RUN_MODE=${RUN_MODE}" >&2
@@ -71,6 +76,9 @@ docker_start() {
   if ! docker_available; then
     echo "docker compose is not available" >&2
     return 1
+  fi
+  if service_known; then
+    systemctl --user stop "${SERVICE_NAME}"
   fi
   if is_running; then
     legacy_stop
@@ -103,6 +111,12 @@ docker_log() {
   compose logs --tail="${lines}" codex-telegram-bot
 }
 
+stop_docker_if_present() {
+  if [ -f "${COMPOSE_FILE}" ] && docker_available; then
+    compose down
+  fi
+}
+
 systemd_available() {
   command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1
 }
@@ -128,15 +142,45 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h
 ExecStart=%h/.codex/scripts/codex-telegram-bot.sh
-Restart=always
+Restart=on-failure
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
+Environment=CODEX_TELEGRAM_RUN_MODE=systemd
 
 [Install]
 WantedBy=default.target
 SERVICE
   systemctl --user daemon-reload
   echo "installed ${SERVICE_FILE}"
+}
+
+systemd_start() {
+  write_service_file
+  if is_running; then
+    legacy_stop
+  fi
+  stop_docker_if_present
+  systemctl --user start "${SERVICE_NAME}"
+  systemctl --user --no-pager --full status "${SERVICE_NAME}"
+}
+
+supervisor_start() {
+  if is_running; then
+    echo "codex telegram bot daemon is already running: $(cat "${PID_FILE}")"
+    return 0
+  fi
+
+  stop_docker_if_present
+  nohup setsid "${SUPERVISOR}" >>"${LOG_FILE}" 2>&1 &
+  echo "$!" >"${PID_FILE}"
+  sleep 1
+
+  if is_running; then
+    echo "codex telegram bot daemon started: $(cat "${PID_FILE}")"
+  else
+    echo "codex telegram bot daemon failed to start; see ${LOG_FILE}" >&2
+    return 1
+  fi
 }
 
 legacy_start() {
@@ -196,16 +240,25 @@ start() {
     docker_start
     return
   fi
-  if service_known; then
-    if is_running; then
-      legacy_stop
-    fi
-    systemctl --user start "${SERVICE_NAME}"
-    systemctl --user --no-pager --full status "${SERVICE_NAME}"
-    return
-  fi
-
-  legacy_start
+  case "${RUN_MODE}" in
+    process|legacy)
+      stop_docker_if_present
+      legacy_start
+      ;;
+    systemd)
+      systemd_start
+      ;;
+    supervisor)
+      supervisor_start
+      ;;
+    auto|host)
+      if systemd_available; then
+        systemd_start
+      else
+        supervisor_start
+      fi
+      ;;
+  esac
 }
 
 stop() {
@@ -217,6 +270,7 @@ stop() {
     systemctl --user stop "${SERVICE_NAME}"
   fi
   legacy_stop
+  stop_docker_if_present
 }
 
 restart() {
@@ -270,8 +324,8 @@ enable_service() {
     return
   fi
   write_service_file
-  systemctl --user enable "${SERVICE_NAME}"
-  echo "enabled ${SERVICE_NAME} for user autostart"
+  systemctl --user enable --now "${SERVICE_NAME}"
+  echo "enabled and started ${SERVICE_NAME} for user autostart"
 }
 
 disable_service() {

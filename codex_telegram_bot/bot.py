@@ -1095,8 +1095,13 @@ class CodexTelegramBot:
         )
         queued = 0
         for task in tasks:
-            if is_recorded_process_alive(task, pid_alive):
+            process_alive = is_recorded_process_alive(task, pid_alive)
+            if process_alive and not task.runtime_id:
                 continue
+            if process_alive and task.runtime_id == self.runner.runtime_id:
+                continue
+            if process_alive:
+                terminate_process_group(task.pid)
 
             previous_phase = task.phase
             task.pid = None

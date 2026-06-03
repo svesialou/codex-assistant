@@ -19,10 +19,12 @@ cp "${REPO_DIR}/README.md" "${TOOL_DIR}/README.md"
 find "${TOOL_DIR}" -type d -name __pycache__ -prune -exec rm -rf {} +
 
 cp "${REPO_DIR}/scripts/codex-telegram-bot.sh" "${SCRIPTS_DIR}/codex-telegram-bot.sh"
+cp "${REPO_DIR}/scripts/codex-telegram-bot-supervisor.sh" "${SCRIPTS_DIR}/codex-telegram-bot-supervisor.sh"
 cp "${REPO_DIR}/scripts/codex-project-index.sh" "${SCRIPTS_DIR}/codex-project-index.sh"
 cp "${REPO_DIR}/scripts/codex-telegram-bot-control.sh" "${SCRIPTS_DIR}/codex-telegram-bot-control.sh"
 chmod +x \
   "${SCRIPTS_DIR}/codex-telegram-bot.sh" \
+  "${SCRIPTS_DIR}/codex-telegram-bot-supervisor.sh" \
   "${SCRIPTS_DIR}/codex-project-index.sh" \
   "${SCRIPTS_DIR}/codex-telegram-bot-control.sh"
 
@@ -39,7 +41,7 @@ CODEX_TELEGRAM_CHAT_ID=
 CODEX_TELEGRAM_ALLOWED_CHAT_IDS=
 CODEX_TELEGRAM_ALLOWED_USER_IDS=
 
-# Project roots can be anywhere under CODEX_HOST_WORKSPACE_ROOT in Docker mode.
+# Project roots are used by the host daemon and optional Docker mode.
 CODEX_TELEGRAM_PROJECT_DIRS=${HOME}/Projects:${HOME}/MyProjects
 CODEX_TELEGRAM_WORKSPACE_ROOT=${HOME}
 CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS=1
@@ -47,6 +49,20 @@ ENV
   chmod 600 "${ENV_FILE}"
   echo "created ${ENV_FILE}; fill Telegram token and chat id before starting"
 fi
+
+ensure_env_value() {
+  local key="$1"
+  local value="$2"
+  if ! grep -q "^[[:space:]]*${key}=" "${ENV_FILE}" 2>/dev/null; then
+    printf '%s=%s\n' "${key}" "${value}" >>"${ENV_FILE}"
+  fi
+}
+
+ensure_env_value "CODEX_TELEGRAM_PROJECT_DIRS" "${HOME}/Projects:${HOME}/MyProjects"
+ensure_env_value "CODEX_TELEGRAM_WORKSPACE_ROOT" "${HOME}"
+ensure_env_value "CODEX_TELEGRAM_INDEX_DIR" "${CODEX_HOME}/project-index"
+ensure_env_value "CODEX_TELEGRAM_STATE_DIR" "${CODEX_HOME}/telegram-bot"
+ensure_env_value "CODEX_TELEGRAM_RECOVER_INTERRUPTED_TASKS" "1"
 
 if [ -f "${ENV_FILE}" ]; then
   # shellcheck disable=SC1090
@@ -82,3 +98,4 @@ fi
 
 echo "installed codex assistant into ${CODEX_HOME}"
 echo "run: ${SCRIPTS_DIR}/codex-telegram-bot-control.sh restart"
+echo "autostart: ${SCRIPTS_DIR}/codex-telegram-bot-control.sh enable"

@@ -200,7 +200,7 @@ def interrupted_execution_prompt(
     plan = task.plan_text.strip() or "No prior plan was recorded."
     log_tail = previous_log_tail.strip() or "-"
     final_text = previous_final.strip() or "-"
-    return f"""The previous Codex process for this Telegram task was interrupted by a bot or container restart.
+    return f"""The previous Codex process for this Telegram task was interrupted by a bot, daemon, or container restart.
 
 Continue from the current workspace state. First inspect git status, relevant files, existing logs, and the existing final answer if useful.
 Do not assume that no work was done before the restart. Do not repeat already completed changes.

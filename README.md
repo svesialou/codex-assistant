@@ -3,16 +3,17 @@
 Local Telegram long-poll bot for starting Codex tasks in local projects.
 Project directories are configured through environment files during install.
 
-The bot itself is Python stdlib-only. Docker is the recommended runtime because
-`restart: unless-stopped` keeps the bot running after crashes and daemon restarts.
+The bot itself is Python stdlib-only. The default runtime is a host daemon:
+`systemd --user` when available, otherwise a small background supervisor script.
+Codex tasks therefore run through the host `codex` CLI, not inside Docker.
 
 ## What Is Stored Where
 
-- Repository: source code, tests, Docker config, install scripts.
+- Repository: source code, tests, optional Docker config, install scripts.
 - `~/.codex/secrets/telegram.env`: Telegram and optional Slack secrets.
 - `~/.codex/telegram-bot`: task state, attachments, logs, chat state.
 - `~/.codex/project-index`: generated project index and per-project context.
-- `~/.codex/auth.json` and `~/.codex/config.toml`: Codex CLI auth/config reused by the container.
+- `~/.codex/auth.json` and `~/.codex/config.toml`: Codex CLI auth/config reused by host Codex tasks.
 
 Do not commit `~/.codex`, `.env`, logs, sqlite files, or task state.
 
@@ -20,9 +21,9 @@ Do not commit `~/.codex`, `.env`, logs, sqlite files, or task state.
 
 Prerequisites:
 
-- Docker with Compose v2
 - Git
 - A configured Codex CLI account in `~/.codex` on the host
+- Python 3.12+
 - Telegram bot token and allowed chat id
 
 Clone anywhere and install:
@@ -37,7 +38,6 @@ Configure secrets and project roots:
 
 ```sh
 nano ~/.codex/secrets/telegram.env
-nano .env
 ```
 
 Required values:
@@ -59,7 +59,7 @@ positive id as the allowed user id by default. For group chats, set
 `CODEX_TELEGRAM_ALLOWED_USER_IDS` explicitly; otherwise the bot refuses to start
 instead of accepting commands from everyone in the group.
 
-Start through Docker:
+Start the host daemon:
 
 ```sh
 ~/.codex/scripts/codex-telegram-bot-control.sh restart
@@ -67,11 +67,30 @@ Start through Docker:
 ~/.codex/scripts/codex-telegram-bot-control.sh log
 ```
 
-The control script uses Docker automatically when the cloned repository and
-`docker-compose.yml` are available. Set `CODEX_TELEGRAM_RUN_MODE=process` only
-when you explicitly want the old background-process mode.
+`restart` prefers `systemd --user` and automatically installs
+`codex-telegram-bot.service` with `Restart=on-failure`. If user systemd is not
+available, the control script starts `codex-telegram-bot-supervisor.sh` in the
+background; it restarts the bot after crashes. Use
+`~/.codex/scripts/codex-telegram-bot-control.sh enable` to enable user autostart
+on systems with `systemd --user`.
 
-## Docker Runtime
+Runtime modes:
+
+```sh
+CODEX_TELEGRAM_RUN_MODE=auto       # default: systemd if available, else supervisor
+CODEX_TELEGRAM_RUN_MODE=systemd    # require systemd --user
+CODEX_TELEGRAM_RUN_MODE=supervisor # force the host supervisor
+CODEX_TELEGRAM_RUN_MODE=process    # one background process without restart loop
+CODEX_TELEGRAM_RUN_MODE=docker     # optional Docker runtime
+```
+
+## Optional Docker Runtime
+
+Docker is still available as an explicit opt-in:
+
+```sh
+CODEX_TELEGRAM_RUN_MODE=docker ~/.codex/scripts/codex-telegram-bot-control.sh restart
+```
 
 Compose mounts Codex config and one host workspace root into the container:
 
@@ -99,7 +118,7 @@ CODEX_TELEGRAM_PROJECT_DIRS=/data/work/company:/data/work/personal
 ```
 
 For roots that do not share a practical parent, use a broader common parent
-such as `/home/your-user`, or run in process mode on the host.
+such as `/home/your-user`, or use the default host daemon runtime.
 
 On container startup, Compose rebuilds the project index with container paths
 before starting the long-poll bot. Because the workspace root is mounted to the

@@ -192,7 +192,7 @@ class CodexRunnerTest(unittest.TestCase):
             "partial final",
         )
 
-        self.assertIn("interrupted by a bot or container restart", prompt)
+        self.assertIn("interrupted by a bot, daemon, or container restart", prompt)
         self.assertIn("Do not repeat already completed changes", prompt)
         self.assertIn("/tmp/task/run.log", prompt)
         self.assertIn("partial final", prompt)
