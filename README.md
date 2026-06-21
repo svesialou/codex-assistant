@@ -82,16 +82,36 @@ owned by the bot service, the control script schedules a deferred restart in a
 separate transient user unit so the current Codex process can finish before the
 bot service is restarted.
 
+`enable` also installs `codex-network-watchdog.timer`. It checks real internet
+connectivity once per minute with HTTP probes before trusting the local
+NetworkManager state. If the machine reports a wired/VPN connection but the
+internet is unreachable, it reconnects matching active NetworkManager
+connections and then lets the bot watchdog start or recover the bot. Reconnects
+are throttled by a five minute cooldown.
+
 Useful host daemon commands:
 
 ```sh
 ~/.codex/scripts/codex-telegram-bot-control.sh enable
 ~/.codex/scripts/codex-telegram-bot-control.sh watchdog-status
 ~/.codex/scripts/codex-telegram-bot-control.sh watchdog-check
+~/.codex/scripts/codex-telegram-bot-control.sh network-watchdog-status
+~/.codex/scripts/codex-telegram-bot-control.sh network-status
 ~/.codex/scripts/codex-telegram-bot-control.sh disable
 ```
 
-`disable` stops and disables both the bot service and the watchdog timer.
+`disable` stops and disables the bot service, bot watchdog timer, and network
+watchdog timer.
+
+Network watchdog configuration:
+
+```sh
+CODEX_NETWORK_RECONNECT_ENABLED=0         # check only, never reconnect
+CODEX_NETWORK_RECONNECT_COOLDOWN_SECONDS=300
+CODEX_NETWORK_CHECK_URLS="https://api.telegram.org http://connectivity-check.ubuntu.com/"
+CODEX_NETWORK_RECONNECT_TYPES="vpn:tun:802-3-ethernet:802-11-wireless"
+CODEX_NETWORK_RECONNECT_CONNECTIONS="netplan-enp3s0"
+```
 
 Runtime modes:
 
@@ -168,6 +188,14 @@ Run the bot without Docker:
 PYTHONPATH=. python3 -m codex_telegram_bot
 ```
 
+The installed host runner auto-syncs runtime code from the source repository
+recorded in `~/.codex/codex-assistant.repo` before starting the bot. Disable it
+only for troubleshooting:
+
+```sh
+CODEX_TELEGRAM_AUTO_SYNC=0 ~/.codex/scripts/codex-telegram-bot-control.sh restart
+```
+
 Rebuild the project index:
 
 ```sh
@@ -210,6 +238,19 @@ to continue from the current workspace instead of blindly repeating completed
 work.
 
 Optional Slack forwarding:
+
+```sh
+CODEX_SLACK_DESKTOP_NOTIFICATIONS=1
+CODEX_SLACK_TELEGRAM_CHAT_IDS=123456789
+```
+
+Desktop notification forwarding is enabled by default and does not use Slack
+API. The bot listens to local `org.freedesktop.Notifications` events through
+`dbus-monitor` and forwards Slack notifications that the desktop session already
+shows in the tray. Only the sender/title and message text exposed by the local
+notification are available.
+
+Optional Slack API polling:
 
 ```sh
 CODEX_SLACK_TOKEN=xoxp-or-xoxb-token

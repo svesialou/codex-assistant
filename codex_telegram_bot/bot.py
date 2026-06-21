@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .activity_status import extract_codex_activity, render_codex_status
+from .agent_roles import AGENT_ROLES
 from .config import Config
 from .codex_runner import CodexRunner, extract_session_id
 from .project_index import (
@@ -25,11 +26,31 @@ from .project_index import (
 )
 from .slack import (
     SlackAPI,
+    SlackDesktopNotificationStore,
+    SlackDesktopNotificationWatcher,
     SlackNotification,
     SlackStateStore,
     SlackWatcher,
     render_slack_notification,
 )
+from .services.git_safety import (
+    GitSnapshot,
+    capture_git_snapshot,
+    read_git_snapshot,
+    snapshot_summary,
+    write_git_snapshot,
+)
+from .services.intent_router import IntentContext, IntentResult, IntentRouter
+from .services.project_aliases import (
+    ProjectAliasStore,
+    ProjectResolution,
+    render_aliases,
+    render_resolution_error,
+)
+from .services.project_memory import ProjectMemoryStore
+from .services.runtime_identity import render_runtime_identity, runtime_identity
+from .services.runtime_sync import compare_runtime_files, render_runtime_drift
+from .services.task_events import TaskEventLog, render_task_events
 from .task_store import (
     ChatState,
     TaskRecord,
@@ -67,6 +88,13 @@ Commands:
 /status [task_id] - show global active processes or one task
 /processes - show active Codex processes across projects
 /logs <task_id> - show recent execution log lines
+/brain <task_id> - show agent event log for a task
+/events <task_id> - same as /brain
+/alias list|add|remove - manage project aliases
+/aliases - list project aliases
+/remember <text> - propose a project memory note
+/memory - show selected project memory
+/runtime - show source/runtime identity
 
 Flow:
 1. Choose root or project with buttons.
@@ -86,6 +114,10 @@ BOT_COMMANDS = [
     {"command": "project", "description": "Select default project"},
     {"command": "status", "description": "Show processes or task status"},
     {"command": "processes", "description": "Show active Codex processes"},
+    {"command": "alias", "description": "Manage project aliases"},
+    {"command": "memory", "description": "Show project memory"},
+    {"command": "remember", "description": "Save project memory note"},
+    {"command": "brain", "description": "Show task brain events"},
     {"command": "agent", "description": "Toggle agent mode"},
     {"command": "help", "description": "Show help"},
 ]
@@ -102,6 +134,7 @@ TASK_FILTERS: dict[str, set[str] | None] = {
 PROCESS_PHASES = {"planning", "running", "agent_running"}
 BLOCKING_FOLLOWUP_PHASES = {"created", "planning", "planned", "running", "agent_running"}
 ATTACHABLE_PHASES = {"created", "planned", "failed"}
+ANSWERABLE_PHASES = ATTACHABLE_PHASES | PROCESS_PHASES
 MAX_ATTACHMENT_SIZE_BYTES = 20 * 1024 * 1024
 PROMPT_DRAFT_SEPARATOR = "\n\n"
 DEFAULT_CONTINUATION_PROMPT = "Continue development using the attached context."
@@ -126,17 +159,21 @@ def inline_task_keyboard(task_id: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {"text": "Execute", "callback_data": f"confirm:{task_id}"},
-                {"text": "Answer clarification", "callback_data": f"answer:{task_id}"},
+                {"text": "▶️ Выполнить", "callback_data": f"task:execute:{task_id}"},
+                {"text": "✏️ Уточнить", "callback_data": f"task:answer:{task_id}"},
             ],
             [
-                {"text": "Add files", "callback_data": f"attach:{task_id}"},
-                {"text": "Cancel", "callback_data": f"cancel:{task_id}"},
+                {"text": "🧠 Мозги", "callback_data": f"task:brain:{task_id}"},
+                {"text": "🛡 Safety", "callback_data": f"task:safety:{task_id}"},
             ],
             [
-                {"text": "Task", "callback_data": f"task:{task_id}"},
-                {"text": "Menu", "callback_data": "menu"},
-            ]
+                {"text": "📎 Файлы", "callback_data": f"task:files:{task_id}"},
+                {"text": "📜 Логи", "callback_data": f"task:logs:{task_id}"},
+            ],
+            [
+                {"text": "❌ Отменить", "callback_data": f"task:cancel:{task_id}"},
+                {"text": "📊 Статус", "callback_data": f"task:status:{task_id}"},
+            ],
         ]
     }
 
@@ -145,18 +182,93 @@ def completed_task_keyboard(task_id: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {"text": "Continue", "callback_data": f"continue:{task_id}"},
-                {"text": "Add context", "callback_data": f"contctx:{task_id}"},
+                {"text": "🔍 Review", "callback_data": f"task:review:{task_id}"},
+                {"text": "📊 Изменения", "callback_data": f"task:safety:{task_id}"},
             ],
             [
-                {"text": "Add files", "callback_data": f"contattach:{task_id}"},
-                {"text": "Run continuation", "callback_data": f"contrun:{task_id}"},
+                {"text": "📜 Логи", "callback_data": f"task:logs:{task_id}"},
+                {"text": "🔁 Продолжить", "callback_data": f"task:continue:{task_id}"},
             ],
             [
-                {"text": "Task", "callback_data": f"task:{task_id}"},
-                {"text": "Logs", "callback_data": f"logs:{task_id}"},
+                {"text": "➕ Контекст", "callback_data": f"contctx:{task_id}"},
+                {"text": "📎 Файлы", "callback_data": f"contattach:{task_id}"},
             ],
-            [{"text": "Tasks", "callback_data": "tasks:done"}, {"text": "Menu", "callback_data": "menu"}],
+            [
+                {"text": "💾 В память", "callback_data": f"task:remember:{task_id}"},
+                {"text": "🧠 Мозги", "callback_data": f"task:brain:{task_id}"},
+            ],
+            [{"text": "📊 Статус", "callback_data": f"task:status:{task_id}"}, {"text": "Menu", "callback_data": "menu"}],
+        ]
+    }
+
+
+def running_task_keyboard(task_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✏️ Уточнить", "callback_data": f"task:answer:{task_id}"},
+                {"text": "📊 Статус", "callback_data": f"task:status:{task_id}"},
+            ],
+            [
+                {"text": "🧠 Мозги", "callback_data": f"task:brain:{task_id}"},
+                {"text": "📜 Логи", "callback_data": f"task:logs:{task_id}"},
+            ],
+            [
+                {"text": "❌ Остановить", "callback_data": f"task:cancel:{task_id}"},
+            ],
+        ]
+    }
+
+
+def created_task_keyboard(task_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📋 План", "callback_data": f"task:plan:{task_id}"},
+                {"text": "🧠 Мозги", "callback_data": f"task:brain:{task_id}"},
+            ],
+            [
+                {"text": "📎 Файлы", "callback_data": f"task:files:{task_id}"},
+                {"text": "❌ Отменить", "callback_data": f"task:cancel:{task_id}"},
+            ],
+        ]
+    }
+
+
+def failed_task_keyboard(task_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "📜 Логи", "callback_data": f"task:logs:{task_id}"},
+                {"text": "🧠 Мозги", "callback_data": f"task:brain:{task_id}"},
+            ],
+            [
+                {"text": "✏️ Уточнить", "callback_data": f"task:answer:{task_id}"},
+                {"text": "❌ Закрыть", "callback_data": f"task:cancel:{task_id}"},
+            ],
+        ]
+    }
+
+
+def memory_confirm_keyboard(project_slug: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Сохранить", "callback_data": f"memory:save_pending:{project_slug}"},
+                {"text": "✏️ Изменить", "callback_data": f"memory:edit_pending:{project_slug}"},
+            ],
+            [{"text": "❌ Не сохранять", "callback_data": f"memory:skip_pending:{project_slug}"}],
+        ]
+    }
+
+
+def alias_confirm_keyboard() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "✅ Добавить", "callback_data": "alias:save_pending"},
+                {"text": "❌ Отмена", "callback_data": "alias:cancel_pending"},
+            ]
         ]
     }
 
@@ -190,14 +302,16 @@ def main_menu_keyboard(agent_mode: bool) -> dict[str, Any]:
                 {"text": "Projects", "callback_data": "projects:0"},
             ],
             [
-                {"text": "New task", "callback_data": "new"},
-                {"text": "Run task", "callback_data": "runnew"},
+                {"text": "🛠 Создать задачу", "callback_data": "new"},
+                {"text": "▶️ Run task", "callback_data": "runnew"},
             ],
             [
-                {"text": "Tasks", "callback_data": "tasks:active"},
+                {"text": "📊 Статус", "callback_data": "processes"},
+                {"text": "🧠 Мозги", "callback_data": "task:brain:last"},
             ],
             [
-                {"text": "Processes", "callback_data": "processes"},
+                {"text": "📖 Память проекта", "callback_data": "memory:show:current"},
+                {"text": "📁 Сменить проект", "callback_data": "projects:0"},
             ],
             [
                 {"text": agent_label, "callback_data": "agent:toggle"},
@@ -254,10 +368,42 @@ def agent_response_keyboard(task_id: str) -> dict[str, Any]:
     }
 
 
+def task_progress_keyboard(task_id: str, phase: str) -> dict[str, Any]:
+    if phase == "planned":
+        return inline_task_keyboard(task_id)
+    if phase in {"planning", "running", "agent_running"}:
+        return running_task_keyboard(task_id)
+    if phase == "failed":
+        return failed_task_keyboard(task_id)
+    if phase == "completed":
+        return completed_task_keyboard(task_id)
+    return created_task_keyboard(task_id)
+
+
 def command_parts(text: str) -> tuple[str, str]:
     head, _, tail = text.partition(" ")
     command = head.split("@", 1)[0].lower()
     return command, tail.strip()
+
+
+def normalize_context_project_slugs(
+    primary_slug: str,
+    slugs: list[str] | tuple[str, ...],
+) -> list[str]:
+    result: list[str] = []
+    for slug in [primary_slug, *slugs]:
+        if slug and slug not in result:
+            result.append(slug)
+    return result or [primary_slug]
+
+
+def split_project_queries(query: str) -> list[str]:
+    value = re.sub(r"\s+(?:и|and)\s+", ",", query, flags=re.IGNORECASE)
+    return [
+        item.strip(" \t\r\n`'\".?!")
+        for item in re.split(r"[,;]+", value)
+        if item.strip(" \t\r\n`'\".?!")
+    ]
 
 
 def pending_task_id(pending_action: str | None, action: str) -> str | None:
@@ -306,6 +452,7 @@ class PromptDraft:
     user_id: int | None
     action: str
     project_slug: str
+    context_project_slugs: tuple[str, ...]
     parts: tuple[str, ...]
     source: str
     source_path: str
@@ -361,6 +508,10 @@ class CodexTelegramBot:
         self.api = TelegramAPI(config.bot_token)
         self.store = TaskStore(config.state_dir)
         self.runner = CodexRunner(config, self.store)
+        self.aliases = ProjectAliasStore(config.index_dir)
+        self.events = TaskEventLog(self.store)
+        self.memory = ProjectMemoryStore(config.index_dir, config.state_dir)
+        self.intent_router = IntentRouter()
         self.projects: list[ProjectInfo] = []
         self.offset: int | None = None
         self.stop_event = threading.Event()
@@ -369,6 +520,7 @@ class CodexTelegramBot:
         self._draft_lock = threading.RLock()
         self._draft_timers: dict[int, threading.Timer] = {}
         self.slack_watcher: SlackWatcher | None = None
+        self.slack_desktop_watcher: SlackDesktopNotificationWatcher | None = None
         if config.slack_enabled() and config.slack_token is not None:
             self.slack_watcher = SlackWatcher(
                 api=SlackAPI(config.slack_token),
@@ -377,6 +529,10 @@ class CodexTelegramBot:
                 channel_ids=config.slack_channel_ids,
                 history_limit=config.slack_history_limit,
                 poll_interval_seconds=config.slack_poll_interval_seconds,
+            )
+        if config.slack_desktop_enabled():
+            self.slack_desktop_watcher = SlackDesktopNotificationWatcher(
+                state_store=SlackDesktopNotificationStore(config.state_dir),
             )
 
     def load_or_build_index(self) -> None:
@@ -409,7 +565,26 @@ class CodexTelegramBot:
 
     def find_project(self, query: str) -> ProjectInfo | None:
         with self._projects_lock:
-            return resolve_project(self.projects, query)
+            result = self.aliases.resolve(self.projects, query)
+            return result.project
+
+    def resolve_project_query(self, query: str) -> ProjectResolution:
+        with self._projects_lock:
+            return self.aliases.resolve(self.projects, query)
+
+    def project_matches(self, query: str, limit: int = 6) -> list[ProjectInfo]:
+        normalized = query.strip().lower()
+        if not normalized:
+            return []
+        with self._projects_lock:
+            matches = [
+                project
+                for project in self.projects
+                if normalized in project.slug.lower()
+                or normalized in project.name.lower()
+                or normalized in project.path.lower()
+            ]
+        return matches[:limit]
 
     def project_by_index(self, index: int) -> ProjectInfo | None:
         with self._projects_lock:
@@ -417,19 +592,51 @@ class CodexTelegramBot:
                 return self.projects[index]
         return None
 
-    def current_project(self, chat_id: int) -> ProjectInfo | None:
+    def current_projects(self, chat_id: int) -> list[ProjectInfo]:
         state = self.store.load_chat_state(chat_id)
-        if state.selected_project_slug:
-            project = self.find_project(state.selected_project_slug)
-            if project is not None:
-                return project
-        return self.find_project(ROOT_PROJECT_SLUG)
+        slugs = list(state.active_project_slugs)
+        if not slugs and state.selected_project_slug:
+            slugs = [state.selected_project_slug]
+        if not slugs:
+            slugs = [ROOT_PROJECT_SLUG]
+
+        projects: list[ProjectInfo] = []
+        for slug in slugs:
+            project = self.find_project(slug)
+            if project is not None and project.slug not in {item.slug for item in projects}:
+                projects.append(project)
+
+        if projects:
+            return projects
+
+        root = self.find_project(ROOT_PROJECT_SLUG)
+        return [root] if root is not None else []
+
+    def current_project(self, chat_id: int) -> ProjectInfo | None:
+        projects = self.current_projects(chat_id)
+        return projects[0] if projects else None
+
+    def task_context_project_slugs(
+        self,
+        chat_id: int,
+        project: ProjectInfo,
+    ) -> list[str]:
+        current_slugs = [item.slug for item in self.current_projects(chat_id)]
+        if project.slug in current_slugs:
+            return normalize_context_project_slugs(project.slug, current_slugs)
+        return [project.slug]
 
     def current_context_label(self, chat_id: int) -> str:
-        project = self.current_project(chat_id)
-        if project is None:
+        projects = self.current_projects(chat_id)
+        if not projects:
             return "not selected"
-        return f"{project.slug} ({project.path})"
+        if len(projects) == 1:
+            project = projects[0]
+            return f"{project.slug} ({project.path})"
+        return (
+            f"{projects[0].slug} ({projects[0].path})\n"
+            f"Active projects: {', '.join(project.slug for project in projects)}"
+        )
 
     def authorize(self, chat_id: int, user_id: int | None) -> bool:
         if chat_id not in self.config.allowed_chat_ids:
@@ -487,13 +694,95 @@ class CodexTelegramBot:
     def cleanup_threads(self) -> None:
         self.worker_threads = {thread for thread in self.worker_threads if thread.is_alive()}
 
+    def append_event(
+        self,
+        task_id: str,
+        event_type: str,
+        agent: str,
+        message: str,
+        data: dict[str, Any] | None = None,
+    ) -> None:
+        try:
+            self.events.append_event(task_id, event_type, agent, message, data)
+        except Exception:
+            LOG.exception("failed to append task event")
+
+    def remember_task_context(self, task: TaskRecord, view: str = "") -> None:
+        state = self.store.load_chat_state(task.chat_id)
+        state.last_task_id = task.id
+        if task.phase == "planned":
+            state.last_planned_task_id = task.id
+        if task.phase in {"completed", "agent_completed"}:
+            state.last_completed_task_id = task.id
+        if task.codex_session_id:
+            state.last_task_with_session_id = task.id
+        if view:
+            state.last_shown_view = view
+        self.store.save_chat_state(state)
+
+    def intent_context(self, chat_id: int) -> IntentContext:
+        state = self.store.load_chat_state(chat_id)
+        return IntentContext(
+            last_task_id=state.last_task_id,
+            last_planned_task_id=state.last_planned_task_id,
+            last_completed_task_id=state.last_completed_task_id,
+            last_task_with_session_id=state.last_task_with_session_id,
+        )
+
+    def recent_context_task(
+        self,
+        chat_id: int,
+        task_id: str | None = None,
+        phases: set[str] | None = None,
+    ) -> TaskRecord | None:
+        if task_id and task_id != "last":
+            task = self.store.load_task(task_id)
+            if (
+                task is not None
+                and task.chat_id == chat_id
+                and (phases is None or task.phase in phases)
+            ):
+                return task
+            return None
+
+        state = self.store.load_chat_state(chat_id)
+        candidate_ids = [
+            state.last_task_id,
+            state.last_planned_task_id,
+            state.last_completed_task_id,
+            state.last_task_with_session_id,
+        ]
+        for candidate_id in candidate_ids:
+            if not candidate_id:
+                continue
+            task = self.store.load_task(candidate_id)
+            if task is None or task.chat_id != chat_id:
+                continue
+            if phases is None or task.phase in phases:
+                return task
+
+        tasks = self.store.recent_tasks(chat_id, limit=1, phases=phases)
+        return tasks[0] if tasks else None
+
+    def set_last_view(self, chat_id: int, view: str) -> None:
+        state = self.store.load_chat_state(chat_id)
+        state.last_shown_view = view
+        self.store.save_chat_state(state)
+
     def send_codex_status(
         self,
         task: TaskRecord,
         phase: str,
         activity: str | None = None,
+        reply_markup: dict[str, Any] | None = None,
     ) -> int | None:
-        return self.send(task.chat_id, render_codex_status(task, phase, activity))
+        if reply_markup is None:
+            reply_markup = task_progress_keyboard(task.id, phase)
+        return self.send(
+            task.chat_id,
+            render_codex_status(task, phase, activity),
+            reply_markup=reply_markup,
+        )
 
     def start_codex_status(
         self,
@@ -544,7 +833,12 @@ class CodexTelegramBot:
             if time.monotonic() - last_edit < STATUS_EDIT_MIN_SECONDS:
                 continue
 
-            self.edit_message(task.chat_id, message_id, text)
+            self.edit_message(
+                task.chat_id,
+                message_id,
+                text,
+                reply_markup=task_progress_keyboard(task.id, phase),
+            )
             last_text = text
             last_edit = time.monotonic()
 
@@ -626,6 +920,8 @@ class CodexTelegramBot:
         action, _, value = data.partition(":")
         if data == "menu":
             self.show_menu(chat_id)
+        elif data == "settings:open":
+            self.show_menu(chat_id)
         elif data == "root":
             self.select_root(chat_id)
         elif data == "new":
@@ -648,12 +944,50 @@ class CodexTelegramBot:
                 self.send(chat_id, "Project button is stale. Press Projects again.")
             else:
                 self.select_project_by_record(chat_id, project)
+        elif action == "project":
+            subaction, _, slug = value.partition(":")
+            if subaction == "select" and slug:
+                self.select_project(chat_id, slug)
         elif action == "tasks":
             self.show_tasks(chat_id, value or "active")
         elif action == "task":
-            self.show_task(chat_id, value)
+            subaction, _, task_id = value.partition(":")
+            if subaction in {
+                "brain",
+                "plan",
+                "status",
+                "logs",
+                "safety",
+                "review",
+                "execute",
+                "continue",
+                "cancel",
+                "files",
+                "answer",
+                "remember",
+            }:
+                self.handle_task_callback(chat_id, user_id, subaction, task_id or "last")
+            else:
+                self.show_task(chat_id, value)
         elif action == "logs":
             self.logs(chat_id, value)
+        elif action == "memory":
+            subaction, _, target = value.partition(":")
+            if subaction == "show":
+                self.show_memory(chat_id, None if target == "current" else target)
+            elif subaction == "save_pending":
+                self.save_pending_memory(chat_id, user_id)
+            elif subaction == "edit_pending":
+                self.edit_pending_memory(chat_id, target)
+            elif subaction == "skip_pending":
+                self.skip_pending_memory(chat_id)
+        elif action == "alias":
+            if value == "list":
+                self.show_aliases(chat_id)
+            elif value == "save_pending":
+                self.save_pending_alias(chat_id)
+            elif value == "cancel_pending":
+                self.cancel_pending_alias(chat_id)
         elif action == "taskfrom":
             self.create_task_from_agent(chat_id, value)
         elif action == "agent":
@@ -695,6 +1029,8 @@ class CodexTelegramBot:
             self.select_project(chat_id, args)
         elif command == "/context":
             self.show_context(chat_id, args)
+        elif command in {"/alias", "/aliases"}:
+            self.alias_command(chat_id, "list" if command == "/aliases" and not args else args)
         elif command == "/new":
             self.start_new_task_input(chat_id)
         elif command == "/agent":
@@ -719,6 +1055,14 @@ class CodexTelegramBot:
             self.show_processes(chat_id)
         elif command == "/logs":
             self.logs(chat_id, args.strip())
+        elif command in {"/brain", "/events"}:
+            self.show_task_brain(chat_id, args.strip() or "last")
+        elif command == "/memory":
+            self.show_memory(chat_id)
+        elif command == "/remember":
+            self.remember_command(chat_id, user_id, args)
+        elif command == "/runtime":
+            self.show_runtime_identity(chat_id)
         else:
             self.send(chat_id, "Unknown command. Use /help.")
 
@@ -760,15 +1104,39 @@ class CodexTelegramBot:
             self.send(chat_id, text, reply_markup=reply_markup)
 
     def select_project_by_record(self, chat_id: int, project: ProjectInfo) -> None:
+        self.select_projects_by_records(chat_id, [project])
+
+    def select_projects_by_records(self, chat_id: int, projects: list[ProjectInfo]) -> None:
+        unique_projects: list[ProjectInfo] = []
+        for project in projects:
+            if project.slug not in {item.slug for item in unique_projects}:
+                unique_projects.append(project)
+
+        if not unique_projects:
+            self.send(chat_id, "Project not found or query is ambiguous. Use /projects <query>.")
+            return
+
         state = self.store.load_chat_state(chat_id)
-        state.selected_project_slug = project.slug
+        state.selected_project_slug = unique_projects[0].slug
+        state.active_project_slugs = [project.slug for project in unique_projects]
         state.pending_action = None
         self.store.save_chat_state(state)
-        self.send(
-            chat_id,
-            f"Selected context: {project.slug}\n{project.path}",
-            reply_markup=main_menu_keyboard(state.agent_mode),
-        )
+        if len(unique_projects) == 1:
+            text = (
+                f"Ок, активный проект: {unique_projects[0].slug}.\n"
+                f"{unique_projects[0].path}\n\n"
+                "Что делаем?"
+            )
+        else:
+            lines = [
+                f"Selected active development context: {len(unique_projects)} projects",
+                f"Primary: {unique_projects[0].slug}",
+            ]
+            lines.extend(f"- {project.slug} | {project.path}" for project in unique_projects)
+            lines.append("")
+            lines.append("Что делаем?")
+            text = "\n".join(lines)
+        self.send(chat_id, text, reply_markup=main_menu_keyboard(state.agent_mode))
 
     def select_root(self, chat_id: int) -> None:
         project = self.find_project(ROOT_PROJECT_SLUG)
@@ -846,11 +1214,94 @@ class CodexTelegramBot:
         self.send(chat_id, f"Indexed {count} projects.\n{self.config.index_dir}/PROJECTS.md")
 
     def select_project(self, chat_id: int, query: str) -> None:
-        project = self.find_project(query)
-        if project is None:
-            self.send(chat_id, "Project not found or query is ambiguous. Use /projects <query>.")
+        result = self.resolve_project_query(query)
+        if result.project is None:
+            self.send(chat_id, render_resolution_error(result))
             return
-        self.select_project_by_record(chat_id, project)
+        self.select_project_by_record(chat_id, result.project)
+
+    def show_aliases(self, chat_id: int) -> None:
+        self.send(
+            chat_id,
+            render_aliases(self.aliases.list_aliases()),
+            reply_markup={"inline_keyboard": [[{"text": "Menu", "callback_data": "menu"}]]},
+        )
+
+    def alias_command(self, chat_id: int, args: str) -> None:
+        parts = args.split()
+        if not parts or parts[0] == "list":
+            self.show_aliases(chat_id)
+            return
+        if parts[0] == "remove" and len(parts) == 2:
+            removed = self.aliases.remove_alias(parts[1])
+            self.send(chat_id, f"Alias removed: {parts[1]}" if removed else f"Alias not found: {parts[1]}")
+            return
+        if parts[0] == "add" and len(parts) >= 3:
+            alias = parts[1]
+            project_query = " ".join(parts[2:])
+            result = self.resolve_project_query(project_query)
+            if result.project is None:
+                self.send(chat_id, render_resolution_error(result))
+                return
+            try:
+                self.aliases.add_alias(alias, result.project.slug)
+            except ValueError as exc:
+                self.send(chat_id, f"Alias not saved: {exc}")
+                return
+            self.send(chat_id, f"Alias saved: {alias} → {result.project.slug}")
+            return
+        self.send(chat_id, "Usage: /alias list | /alias add <alias> <project> | /alias remove <alias>")
+
+    def show_memory(self, chat_id: int, project_slug: str | None = None) -> None:
+        project = self.current_project(chat_id) if project_slug is None else self.find_project(project_slug)
+        if project is None:
+            self.send(chat_id, "Сначала выберите проект.", reply_markup=project_keyboard(list(self.projects), 0))
+            return
+        text = self.memory.read_project_memory(project.slug)
+        self.set_last_view(chat_id, "memory")
+        self.send(
+            chat_id,
+            f"Memory for {project.slug}:\n{text or '-'}",
+            reply_markup=main_menu_keyboard(self.store.load_chat_state(chat_id).agent_mode),
+        )
+
+    def remember_command(self, chat_id: int, user_id: int | None, args: str) -> None:
+        if not args.strip():
+            self.send(chat_id, "Usage: /remember <text>")
+            return
+        self.propose_memory_note(chat_id, user_id, args)
+
+    def propose_task_memory(self, chat_id: int, user_id: int | None, task_id: str) -> None:
+        task = self.store.load_task(task_id)
+        if task is None or task.chat_id != chat_id:
+            self.send(chat_id, "Task not found.")
+            return
+        final = ""
+        if task.final_path and Path(task.final_path).exists():
+            final = Path(task.final_path).read_text(encoding="utf-8", errors="replace").strip()
+        draft_parts = [f"Task {task.id}: {task.prompt[:500]}"]
+        if final:
+            draft_parts.append(f"Result: {final[:1000]}")
+        draft = "\n".join(draft_parts)
+        self.append_event(task.id, "memory", "Scribe", "Prepared project memory draft.")
+        self.propose_memory_note(chat_id, user_id, draft, project_slug=task.project_slug)
+
+    def show_runtime_identity(self, chat_id: int) -> None:
+        identity = runtime_identity(__file__)
+        drifts = compare_runtime_files(
+            Path(identity.source_path),
+            Path(identity.installed_path),
+        )
+        roles = ", ".join(
+            f"{role.emoji} {role.name}{' (write)' if role.write_access else ''}"
+            for role in AGENT_ROLES.values()
+        )
+        self.send(
+            chat_id,
+            f"{render_runtime_identity(identity)}\n"
+            f"{render_runtime_drift(drifts)}\n"
+            f"Agent roles: {roles}",
+        )
 
     def show_context(self, chat_id: int, query: str) -> None:
         project = self.find_project(query)
@@ -885,6 +1336,7 @@ class CodexTelegramBot:
         state.prompt_draft_action = None
         state.prompt_draft_user_id = None
         state.prompt_draft_project_slug = None
+        state.prompt_draft_context_project_slugs = []
         state.prompt_draft_parts = []
         state.prompt_draft_source = "text"
         state.prompt_draft_source_path = ""
@@ -912,11 +1364,16 @@ class CodexTelegramBot:
         action: str,
         source: str,
         source_path: str,
+        context_project_slugs: list[str] | None = None,
     ) -> None:
         part = text.strip()
         if not part:
             self.send(chat_id, "Prompt text is empty.")
             return
+        draft_context_slugs = normalize_context_project_slugs(
+            project.slug,
+            context_project_slugs or self.task_context_project_slugs(chat_id, project),
+        )
 
         while True:
             with self._draft_lock:
@@ -933,6 +1390,7 @@ class CodexTelegramBot:
                         state.prompt_draft_action = action
                         state.prompt_draft_user_id = user_id
                         state.prompt_draft_project_slug = project.slug
+                        state.prompt_draft_context_project_slugs = draft_context_slugs
                         state.prompt_draft_source = source
                         state.prompt_draft_source_path = source_path
                     state.prompt_draft_parts.append(part)
@@ -992,6 +1450,10 @@ class CodexTelegramBot:
                 user_id=state.prompt_draft_user_id,
                 action=state.prompt_draft_action,
                 project_slug=state.prompt_draft_project_slug or ROOT_PROJECT_SLUG,
+                context_project_slugs=tuple(
+                    state.prompt_draft_context_project_slugs
+                    or [state.prompt_draft_project_slug or ROOT_PROJECT_SLUG]
+                ),
                 parts=tuple(state.prompt_draft_parts),
                 source=state.prompt_draft_source,
                 source_path=state.prompt_draft_source_path,
@@ -1038,6 +1500,7 @@ class CodexTelegramBot:
                 prompt,
                 source=draft.source,
                 source_path=draft.source_path,
+                context_project_slugs=list(draft.context_project_slugs),
             )
         elif draft.action == "direct_task":
             self.create_direct_task_for_project(
@@ -1047,6 +1510,7 @@ class CodexTelegramBot:
                 prompt,
                 source=draft.source,
                 source_path=draft.source_path,
+                context_project_slugs=list(draft.context_project_slugs),
             )
         elif draft.action == "agent_chat":
             self.ask_agent_for_project(
@@ -1056,6 +1520,7 @@ class CodexTelegramBot:
                 prompt,
                 source=draft.source,
                 source_path=draft.source_path,
+                context_project_slugs=list(draft.context_project_slugs),
             )
         else:
             parent_task_id = pending_task_id(draft.action, "continue_task")
@@ -1129,6 +1594,12 @@ class CodexTelegramBot:
                 task.recovery_attempts += 1
             task.error = "Interrupted by bot restart; recovery queued."
             self.store.save_task(task)
+            self.append_event(
+                task.id,
+                "state_change",
+                "System",
+                f"Recovery queued after interrupted {previous_phase}.",
+            )
             status_message_id = self.send_codex_status(
                 task,
                 previous_phase,
@@ -1165,11 +1636,286 @@ class CodexTelegramBot:
             len(self.config.slack_target_chat_ids),
         )
 
+    def start_slack_desktop_watcher(self) -> None:
+        if self.slack_desktop_watcher is None:
+            return
+
+        thread = threading.Thread(
+            target=self.slack_desktop_watcher.run,
+            args=(self.stop_event, self.send_slack_notification),
+            daemon=True,
+        )
+        self.worker_threads.add(thread)
+        thread.start()
+        LOG.info(
+            "slack desktop watcher started: targets=%d",
+            len(self.config.slack_target_chat_ids),
+        )
+
     def send_slack_notification(self, notification: SlackNotification) -> None:
         text = render_slack_notification(notification)
         for chat_id in self.config.slack_target_chat_ids:
             if chat_id in self.config.allowed_chat_ids:
                 self.send(chat_id, text)
+
+    def handle_intent(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        intent: IntentResult,
+        original_text: str,
+    ) -> bool:
+        if intent.intent == "select_project" and intent.project_query:
+            return self.select_project_conversational(chat_id, intent.project_query)
+        if intent.intent == "add_alias" and intent.project_query and intent.alias:
+            self.propose_alias(chat_id, intent.alias, intent.project_query)
+            return True
+        if intent.intent == "remember" and intent.memory_text:
+            self.propose_memory_note(chat_id, user_id, intent.memory_text)
+            return True
+        if intent.intent == "show_memory":
+            self.show_memory(chat_id)
+            return True
+        if intent.intent == "show_brain":
+            self.show_task_brain(chat_id, intent.task_id or "last")
+            return True
+        if intent.intent == "show_logs":
+            task = self.recent_context_task(chat_id, intent.task_id)
+            if task is None:
+                self.send(chat_id, "Не нашел задачу для логов.", reply_markup=tasks_keyboard())
+                return True
+            self.logs(chat_id, task.id)
+            return True
+        if intent.intent == "show_status":
+            task = self.recent_context_task(chat_id, intent.task_id)
+            if task is not None:
+                self.show_task(chat_id, task.id)
+            else:
+                self.show_processes(chat_id)
+            return True
+        if intent.intent == "show_plan":
+            self.show_task_plan(chat_id, intent.task_id or "last")
+            return True
+        if intent.intent == "show_safety":
+            self.show_task_safety(chat_id, intent.task_id or "last")
+            return True
+        if intent.intent == "show_review":
+            self.show_task_review(chat_id, intent.task_id or "last")
+            return True
+        if intent.intent == "continue_task":
+            task = self.recent_context_task(
+                chat_id,
+                intent.task_id,
+                phases={"completed"},
+            )
+            if task is None:
+                self.send(chat_id, "Не нашел completed задачу с Codex session для продолжения.", reply_markup=tasks_keyboard())
+                return True
+            self.start_continue_input(chat_id, task.id)
+            return True
+        if intent.intent == "confirm_execution":
+            task = self.recent_context_task(
+                chat_id,
+                intent.task_id,
+                phases={"planned"},
+            )
+            if task is None:
+                self.send(chat_id, "Не нашел planned задачу для запуска.", reply_markup=tasks_keyboard())
+                return True
+            self.confirm_task(chat_id, task.id)
+            return True
+        if intent.intent == "cancel_task":
+            task = self.recent_context_task(
+                chat_id,
+                intent.task_id,
+                phases={"created", "planning", "planned", "running", "agent_running"},
+            )
+            if task is None:
+                self.send(chat_id, "Не нашел активную задачу для отмены.", reply_markup=tasks_keyboard())
+                return True
+            self.cancel_task(chat_id, task.id)
+            return True
+        if intent.intent == "list_projects":
+            self.list_projects(chat_id, "")
+            return True
+        if intent.intent == "list_tasks":
+            self.show_tasks(chat_id, "active")
+            return True
+        if intent.intent == "agent_chat":
+            self.queue_agent_prompt(chat_id, user_id, intent.task_text or original_text, source="text", source_path="")
+            return True
+        if intent.intent == "create_task":
+            project = self.current_project(chat_id)
+            if project is None:
+                self.send(chat_id, "Сначала выберите проект.", reply_markup=project_keyboard(list(self.projects), 0))
+                return True
+            self.queue_prompt_draft(
+                chat_id,
+                user_id,
+                project,
+                intent.task_text or original_text,
+                action="new_task",
+                source="text",
+                source_path="",
+            )
+            return True
+        return False
+
+    def select_project_conversational(self, chat_id: int, query: str) -> bool:
+        queries = split_project_queries(query)
+        if not queries:
+            self.send(chat_id, "Укажите проект.", reply_markup=project_keyboard(list(self.projects), 0))
+            return True
+
+        projects: list[ProjectInfo] = []
+        errors: list[str] = []
+        suggestion_rows: list[list[dict[str, str]]] = []
+        with self._projects_lock:
+            all_projects = list(self.projects)
+
+        for item in queries:
+            result = self.resolve_project_query(item)
+            if result.project is not None:
+                projects.append(result.project)
+                continue
+            errors.append(render_resolution_error(result))
+            for suggestion in result.suggestions[:6]:
+                try:
+                    index = all_projects.index(suggestion)
+                except ValueError:
+                    continue
+                suggestion_rows.append(
+                    [{"text": suggestion.slug[:32], "callback_data": f"proj:{index}"}]
+                )
+
+        if errors:
+            rows = suggestion_rows or project_keyboard(all_projects, 0)["inline_keyboard"]
+            self.send(
+                chat_id,
+                "Не смог однозначно выбрать проект.\n\n" + "\n\n".join(errors),
+                reply_markup={"inline_keyboard": rows},
+            )
+            return True
+
+        self.select_projects_by_records(chat_id, projects)
+        return True
+
+    def propose_alias(self, chat_id: int, alias: str, project_query: str) -> None:
+        result = self.resolve_project_query(project_query)
+        if result.project is None:
+            self.send(chat_id, render_resolution_error(result), reply_markup=project_keyboard(list(self.projects), 0))
+            return
+
+        state = self.store.load_chat_state(chat_id)
+        state.pending_alias_name = alias.strip()
+        state.pending_alias_project_slug = result.project.slug
+        state.pending_action = "alias_confirm"
+        self.store.save_chat_state(state)
+        self.send(
+            chat_id,
+            f"Добавить alias?\n{state.pending_alias_name} → {result.project.slug}",
+            reply_markup=alias_confirm_keyboard(),
+        )
+
+    def save_pending_alias(self, chat_id: int) -> None:
+        state = self.store.load_chat_state(chat_id)
+        if not state.pending_alias_name or not state.pending_alias_project_slug:
+            self.send(chat_id, "Нет alias на подтверждение.")
+            return
+        try:
+            self.aliases.add_alias(state.pending_alias_name, state.pending_alias_project_slug)
+        except ValueError as exc:
+            self.send(chat_id, f"Alias не сохранен: {exc}")
+            return
+        text = f"Alias saved: {state.pending_alias_name} → {state.pending_alias_project_slug}"
+        state.pending_alias_name = ""
+        state.pending_alias_project_slug = ""
+        state.pending_action = None
+        self.store.save_chat_state(state)
+        self.send(chat_id, text, reply_markup=main_menu_keyboard(state.agent_mode))
+
+    def cancel_pending_alias(self, chat_id: int) -> None:
+        state = self.store.load_chat_state(chat_id)
+        state.pending_alias_name = ""
+        state.pending_alias_project_slug = ""
+        if state.pending_action == "alias_confirm":
+            state.pending_action = None
+        self.store.save_chat_state(state)
+        self.send(chat_id, "Alias не сохранен.", reply_markup=main_menu_keyboard(state.agent_mode))
+
+    def propose_memory_note(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+        project_slug: str | None = None,
+    ) -> None:
+        del user_id
+        project = self.current_project(chat_id) if project_slug is None else self.find_project(project_slug)
+        if project is None:
+            self.send(chat_id, "Сначала выберите проект.", reply_markup=project_keyboard(list(self.projects), 0))
+            return
+        sanitized = self.memory.sanitize(text)
+        if not sanitized.text:
+            self.send(chat_id, "Не сохраняю заметку: она пустая или похожа на secret.")
+            return
+
+        state = self.store.load_chat_state(chat_id)
+        state.pending_memory_project_slug = project.slug
+        state.pending_memory_text = sanitized.text
+        state.pending_action = f"memory_confirm:{project.slug}"
+        self.store.save_chat_state(state)
+        warning = (
+            f"\n\nОтфильтровано строк как potential secrets: {sanitized.removed_lines}"
+            if sanitized.removed_lines
+            else ""
+        )
+        self.send(
+            chat_id,
+            f"Сохранить в память проекта {project.slug}?\n\n{sanitized.text[:1200]}{warning}",
+            reply_markup=memory_confirm_keyboard(project.slug),
+        )
+
+    def save_pending_memory(self, chat_id: int, user_id: int | None) -> None:
+        state = self.store.load_chat_state(chat_id)
+        if not state.pending_memory_project_slug or not state.pending_memory_text:
+            self.send(chat_id, "Нет заметки на подтверждение.")
+            return
+        sanitized = self.memory.append_project_memory(
+            state.pending_memory_project_slug,
+            state.pending_memory_text,
+            user_id=user_id,
+        )
+        project_slug = state.pending_memory_project_slug
+        last_task_id = state.last_task_id
+        state.pending_memory_project_slug = ""
+        state.pending_memory_text = ""
+        state.pending_action = None
+        self.store.save_chat_state(state)
+        if not sanitized.text:
+            self.send(chat_id, "Не сохранил заметку: после фильтрации нечего сохранять.")
+            return
+        if last_task_id:
+            task = self.store.load_task(last_task_id)
+            if task is not None and task.chat_id == chat_id:
+                self.append_event(task.id, "memory", "Scribe", f"Project memory updated for {project_slug}.")
+        self.send(chat_id, f"Память проекта обновлена: {project_slug}")
+
+    def edit_pending_memory(self, chat_id: int, project_slug: str) -> None:
+        state = self.store.load_chat_state(chat_id)
+        state.pending_action = f"memory_edit:{project_slug}"
+        state.pending_memory_project_slug = project_slug
+        self.store.save_chat_state(state)
+        self.send(chat_id, "Отправьте исправленный текст для памяти проекта.")
+
+    def skip_pending_memory(self, chat_id: int) -> None:
+        state = self.store.load_chat_state(chat_id)
+        state.pending_memory_project_slug = ""
+        state.pending_memory_text = ""
+        if state.pending_action and state.pending_action.startswith("memory_"):
+            state.pending_action = None
+        self.store.save_chat_state(state)
+        self.send(chat_id, "Заметка не сохранена.")
 
     def handle_plain_text(self, chat_id: int, user_id: int | None, text: str) -> None:
         state = self.store.load_chat_state(chat_id)
@@ -1178,6 +1924,11 @@ class CodexTelegramBot:
             state.pending_action = None
             self.store.save_chat_state(state)
             self.answer_task(chat_id, f"{answer_task_id} {text}")
+            return
+
+        memory_project_slug = pending_task_id(state.pending_action, "memory_edit")
+        if memory_project_slug:
+            self.propose_memory_note(chat_id, user_id, text, project_slug=memory_project_slug)
             return
 
         followup_task_id = pending_task_id(state.pending_action, "followup_context")
@@ -1216,36 +1967,35 @@ class CodexTelegramBot:
                 action=state.prompt_draft_action,
                 source=state.prompt_draft_source,
                 source_path=state.prompt_draft_source_path,
+                context_project_slugs=state.prompt_draft_context_project_slugs,
             )
+            return
+
+        if state.pending_action in {"new_task", "direct_task"}:
+            project = self.current_project(chat_id)
+            if project is None:
+                self.send(chat_id, "No context selected and root context is missing. Run /refresh.")
+                return
+            self.queue_prompt_draft(
+                chat_id,
+                user_id,
+                project,
+                text,
+                action=state.pending_action,
+                source="text",
+                source_path="",
+            )
+            return
+
+        intent = self.intent_router.route(text, self.intent_context(chat_id))
+        if state.agent_mode and intent.intent == "create_task":
+            intent = IntentResult("agent_chat", 0.7, task_text=text)
+        if self.handle_intent(chat_id, user_id, intent, text):
             return
 
         project = self.current_project(chat_id)
         if project is None:
             self.send(chat_id, "No context selected and root context is missing. Run /refresh.")
-            return
-
-        if state.pending_action == "new_task":
-            self.queue_prompt_draft(
-                chat_id,
-                user_id,
-                project,
-                text,
-                action="new_task",
-                source="text",
-                source_path="",
-            )
-            return
-
-        if state.pending_action == "direct_task":
-            self.queue_prompt_draft(
-                chat_id,
-                user_id,
-                project,
-                text,
-                action="direct_task",
-                source="text",
-                source_path="",
-            )
             return
 
         if state.agent_mode:
@@ -1262,7 +2012,7 @@ class CodexTelegramBot:
 
         self.send(
             chat_id,
-            "Use buttons, /new, /task, or enable Agent mode.",
+            "Не понял намерение. Выберите действие:",
             reply_markup=main_menu_keyboard(state.agent_mode),
         )
 
@@ -1433,6 +2183,10 @@ class CodexTelegramBot:
             project_name=project.name,
             project_path=project.path,
             prompt="",
+            context_project_slugs=normalize_context_project_slugs(
+                project.slug,
+                parent.context_project_slugs,
+            ),
             kind="followup_task",
             source="text",
             source_path="",
@@ -1595,7 +2349,16 @@ class CodexTelegramBot:
             task,
             "running",
             f"Continuation draft {task.id} started from {parent.id}. Resuming Codex session.",
+            reply_markup=running_task_keyboard(task.id),
         )
+        self.append_event(
+            task.id,
+            "state_change",
+            "CodexDev",
+            f"Continuation started from {parent.id}.",
+            {"parent_task_id": parent.id},
+        )
+        self.remember_task_context(task, "status")
         self.spawn(self.execute_followup_task, task.id, status_message_id)
 
     def queue_followup_prompt(
@@ -1656,13 +2419,20 @@ class CodexTelegramBot:
         if task is None or task.chat_id != chat_id:
             self.send(chat_id, "Task not found.")
             return
-        if task.phase not in ATTACHABLE_PHASES:
+        if task.phase not in ANSWERABLE_PHASES:
             self.send(chat_id, f"Task is {task.phase}; cannot add clarification now.")
             return
 
         state = self.store.load_chat_state(chat_id)
         state.pending_action = f"answer_task:{task.id}"
         self.store.save_chat_state(state)
+        if task.phase in PROCESS_PHASES:
+            self.send(
+                chat_id,
+                f"Send context for active task {task.id}.",
+                reply_markup=running_task_keyboard(task.id),
+            )
+            return
         self.send(
             chat_id,
             f"Send clarification text for task {task.id}.",
@@ -1885,11 +2655,16 @@ class CodexTelegramBot:
         prompt: str,
         source: str,
         source_path: str,
+        context_project_slugs: list[str] | None = None,
     ) -> None:
         prompt = prompt.strip()
         if not prompt:
             self.send(chat_id, "Usage: /ask <text>")
             return
+        task_context_slugs = normalize_context_project_slugs(
+            project.slug,
+            context_project_slugs or self.task_context_project_slugs(chat_id, project),
+        )
 
         task = self.store.create_task(
             chat_id=chat_id,
@@ -1898,10 +2673,18 @@ class CodexTelegramBot:
             project_name=project.name,
             project_path=project.path,
             prompt=prompt,
+            context_project_slugs=task_context_slugs,
             kind="agent_chat",
             source=source,
             source_path=source_path,
         )
+        self.append_event(
+            task.id,
+            "agent_message",
+            "PM",
+            f"Принял read-only agent вопрос для проекта {project.slug}.",
+        )
+        self.remember_task_context(task, "status")
         status_message_id = self.send_codex_status(task, "agent_running")
         self.spawn(self.run_agent_chat, task.id, status_message_id)
 
@@ -1922,6 +2705,7 @@ class CodexTelegramBot:
             return
 
         log_path = self.store.task_dir(task.id) / "agent.log"
+        self.append_event(task.id, "state_change", "Architect", "Read-only agent chat started.")
         status = self.start_codex_status(
             task,
             "agent_running",
@@ -1929,18 +2713,21 @@ class CodexTelegramBot:
             message_id=status_message_id,
         )
         task = self.runner.run_agent_chat(task, project)
+        self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
         if task.final_path and Path(task.final_path).exists():
             final = Path(task.final_path).read_text(encoding="utf-8", errors="replace").strip()
 
         if task.phase == "agent_completed":
+            self.append_event(task.id, "state_change", "System", "Read-only agent response completed.")
             self.send(
                 task.chat_id,
                 final or "Agent response is empty.",
                 reply_markup=agent_response_keyboard(task.id),
             )
         else:
+            self.append_event(task.id, "state_change", "System", f"Read-only agent failed: {task.error}")
             log_tail = tail_file(task.run_log_path, max_lines=60)
             self.send(task.chat_id, f"Agent failed: {task.error}\n\nLog tail:\n{log_tail}")
 
@@ -1960,6 +2747,7 @@ class CodexTelegramBot:
             agent_task.prompt,
             source=agent_task.source,
             source_path=agent_task.source_path,
+            context_project_slugs=agent_task.context_project_slugs,
         )
 
     def create_task(self, chat_id: int, user_id: int | None, args: str) -> None:
@@ -2010,7 +2798,12 @@ class CodexTelegramBot:
         prompt: str,
         source: str,
         source_path: str,
+        context_project_slugs: list[str] | None = None,
     ) -> None:
+        task_context_slugs = normalize_context_project_slugs(
+            project.slug,
+            context_project_slugs or self.task_context_project_slugs(chat_id, project),
+        )
         task = self.store.create_task(
             chat_id=chat_id,
             user_id=user_id,
@@ -2018,17 +2811,27 @@ class CodexTelegramBot:
             project_name=project.name,
             project_path=project.path,
             prompt=prompt,
+            context_project_slugs=task_context_slugs,
             kind="task",
             source=source,
             source_path=source_path,
         )
+        self.append_event(
+            task.id,
+            "agent_message",
+            "PM",
+            f"Создал задачу для проекта {project.slug}.",
+            {"context_project_slugs": task_context_slugs},
+        )
         state = self.store.load_chat_state(chat_id)
         state.pending_action = None
+        state.last_task_id = task.id
         self.store.save_chat_state(state)
         status_message_id = self.send_codex_status(
             task,
             "planning",
             f"Задача создана для {project.slug}. Запускаю read-only planning.",
+            reply_markup=created_task_keyboard(task.id),
         )
         self.spawn(self.plan_task, task.id, status_message_id)
 
@@ -2040,7 +2843,12 @@ class CodexTelegramBot:
         prompt: str,
         source: str,
         source_path: str,
+        context_project_slugs: list[str] | None = None,
     ) -> None:
+        task_context_slugs = normalize_context_project_slugs(
+            project.slug,
+            context_project_slugs or self.task_context_project_slugs(chat_id, project),
+        )
         task = self.store.create_task(
             chat_id=chat_id,
             user_id=user_id,
@@ -2048,17 +2856,27 @@ class CodexTelegramBot:
             project_name=project.name,
             project_path=project.path,
             prompt=prompt,
+            context_project_slugs=task_context_slugs,
             kind="direct_task",
             source=source,
             source_path=source_path,
         )
+        self.append_event(
+            task.id,
+            "agent_message",
+            "PM",
+            f"Создал direct execution task для проекта {project.slug}.",
+            {"context_project_slugs": task_context_slugs},
+        )
         state = self.store.load_chat_state(chat_id)
         state.pending_action = None
+        state.last_task_id = task.id
         self.store.save_chat_state(state)
         status_message_id = self.send_codex_status(
             task,
             "running",
             f"Direct execution task {task.id} created for {project.slug}. Запускаю Codex execution.",
+            reply_markup=running_task_keyboard(task.id),
         )
         self.spawn(self.execute_task, task.id, status_message_id)
 
@@ -2092,20 +2910,33 @@ class CodexTelegramBot:
             project_name=project.name,
             project_path=project.path,
             prompt=prompt,
+            context_project_slugs=normalize_context_project_slugs(
+                project.slug,
+                parent.context_project_slugs,
+            ),
             kind="followup_task",
             source=source,
             source_path=source_path,
             parent_task_id=parent.id,
             codex_session_id=parent.codex_session_id,
         )
+        self.append_event(
+            task.id,
+            "agent_message",
+            "PM",
+            f"Создал continuation task от {parent.id}.",
+            {"parent_task_id": parent.id},
+        )
         state = self.store.load_chat_state(chat_id)
         if state.pending_action == continue_task_action(parent.id):
             state.pending_action = None
-            self.store.save_chat_state(state)
+        state.last_task_id = task.id
+        self.store.save_chat_state(state)
         status_message_id = self.send_codex_status(
             task,
             "running",
             f"Continuation task {task.id} created from {parent.id}. Resuming Codex session.",
+            reply_markup=running_task_keyboard(task.id),
         )
         self.spawn(self.execute_followup_task, task.id, status_message_id)
 
@@ -2126,6 +2957,8 @@ class CodexTelegramBot:
             return
 
         log_path = self.store.task_dir(task.id) / "plan.log"
+        self.append_event(task.id, "state_change", "Architect", "Запущено read-only planning.")
+        self.remember_task_context(task, "status")
         status = self.start_codex_status(
             task,
             "planning",
@@ -2133,18 +2966,28 @@ class CodexTelegramBot:
             message_id=status_message_id,
         )
         task = self.runner.run_planning(task, project)
+        self.remember_task_context(task, "plan" if task.phase == "planned" else "status")
         self.finish_codex_status(status, task)
         if task.phase == "planned":
+            self.append_event(task.id, "state_change", "Architect", "Planning completed.")
+            self.append_event(task.id, "agent_message", "CodexDev", "Ожидаю подтверждения выполнения.")
             self.send(
                 task.chat_id,
                 f"Plan for task {task.id}:\n\n{task.plan_text}",
                 reply_markup=inline_task_keyboard(task.id),
             )
         else:
+            self.append_event(
+                task.id,
+                "state_change",
+                "Architect",
+                f"Planning failed: {task.error}",
+            )
             log_tail = tail_file(task.plan_log_path, max_lines=40)
             self.send(
                 task.chat_id,
                 f"Planning failed for task {task.id}: {task.error}\n\nLog tail:\n{log_tail}",
+                reply_markup=failed_task_keyboard(task.id),
             )
 
     def answer_task(self, chat_id: int, args: str) -> None:
@@ -2157,23 +3000,36 @@ class CodexTelegramBot:
         if task is None or task.chat_id != chat_id:
             self.send(chat_id, "Task not found.")
             return
-        if task.phase not in {"planned", "failed", "created"}:
+        if task.phase not in ANSWERABLE_PHASES:
             self.send(chat_id, f"Task is {task.phase}; cannot add clarification now.")
             return
 
         task.clarifications.append(answer.strip())
-        task.phase = "created"
-        task.plan_text = ""
-        task.error = ""
-        self.store.save_task(task)
         state = self.store.load_chat_state(chat_id)
         if pending_task_id(state.pending_action, "answer_task") == task.id:
             state.pending_action = None
             self.store.save_chat_state(state)
+        if task.phase in PROCESS_PHASES:
+            self.store.save_task(task)
+            self.append_event(task.id, "agent_message", "PM", "Context added to active task.")
+            self.send_codex_status(
+                task,
+                task.phase,
+                f"Контекст сохранен для активной задачи {task.id}. Новая задача не создана.",
+                reply_markup=running_task_keyboard(task.id),
+            )
+            return
+
+        task.phase = "created"
+        task.plan_text = ""
+        task.error = ""
+        self.store.save_task(task)
+        self.append_event(task.id, "agent_message", "PM", "Clarification added; planning will restart.")
         status_message_id = self.send_codex_status(
             task,
             "planning",
             f"Уточнение сохранено для {task.id}. Перезапускаю planning.",
+            reply_markup=created_task_keyboard(task.id),
         )
         self.spawn(self.plan_task, task.id, status_message_id)
 
@@ -2190,10 +3046,12 @@ class CodexTelegramBot:
         if pending_task_id(state.pending_action, "attach_files") == task.id:
             state.pending_action = None
             self.store.save_chat_state(state)
+        self.append_event(task.id, "state_change", "CodexDev", "Execution confirmed by user.")
         status_message_id = self.send_codex_status(
             task,
             "running",
             f"Задача {task.id} подтверждена. Запускаю Codex execution.",
+            reply_markup=running_task_keyboard(task.id),
         )
         self.spawn(self.execute_task, task.id, status_message_id)
 
@@ -2219,6 +3077,14 @@ class CodexTelegramBot:
             return
 
         log_path = self.store.task_dir(task.id) / "run.log"
+        self.append_event(task.id, "state_change", "CodexDev", "Execution started.")
+        pre_snapshot = self.record_git_safety_snapshot(task, "pre-execution")
+        if pre_snapshot.is_dirty:
+            self.send(
+                task.chat_id,
+                f"⚠️ Safety warning for {task.id}: {snapshot_summary(pre_snapshot)}",
+                reply_markup=running_task_keyboard(task.id),
+            )
         status = self.start_codex_status(
             task,
             "running",
@@ -2229,21 +3095,27 @@ class CodexTelegramBot:
             task = self.runner.run_recovery_execution(task, project)
         else:
             task = self.runner.run_execution(task, project)
+        post_snapshot = self.record_git_safety_snapshot(task, "post-execution")
+        self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
         if task.final_path and Path(task.final_path).exists():
             final = Path(task.final_path).read_text(encoding="utf-8", errors="replace").strip()
 
         if task.phase == "completed":
+            self.append_event(task.id, "state_change", "System", "Execution completed successfully.")
             message = f"Task {task.id} completed.\n\n{final or 'Final response is empty.'}"
-            reply_markup = completed_task_keyboard(task.id) if task.codex_session_id else None
+            if post_snapshot.is_dirty:
+                message += f"\n\nSafety: {snapshot_summary(post_snapshot)}"
+            reply_markup = completed_task_keyboard(task.id)
         else:
+            self.append_event(task.id, "state_change", "System", f"Execution failed: {task.error}")
             log_tail = tail_file(task.run_log_path, max_lines=60)
             message = (
                 f"Task {task.id} failed: {task.error}\n\n"
                 f"Final:\n{final or '-'}\n\nLog tail:\n{log_tail}"
             )
-            reply_markup = None
+            reply_markup = failed_task_keyboard(task.id)
         self.send(task.chat_id, message, reply_markup=reply_markup)
 
     def execute_followup_task(
@@ -2267,6 +3139,14 @@ class CodexTelegramBot:
             return
 
         log_path = self.store.task_dir(task.id) / "run.log"
+        self.append_event(task.id, "state_change", "CodexDev", "Continuation execution started.")
+        pre_snapshot = self.record_git_safety_snapshot(task, "pre-execution")
+        if pre_snapshot.is_dirty:
+            self.send(
+                task.chat_id,
+                f"⚠️ Safety warning for {task.id}: {snapshot_summary(pre_snapshot)}",
+                reply_markup=running_task_keyboard(task.id),
+            )
         status = self.start_codex_status(
             task,
             "running",
@@ -2274,21 +3154,27 @@ class CodexTelegramBot:
             message_id=status_message_id,
         )
         task = self.runner.run_followup_execution(task, project)
+        post_snapshot = self.record_git_safety_snapshot(task, "post-execution")
+        self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
         if task.final_path and Path(task.final_path).exists():
             final = Path(task.final_path).read_text(encoding="utf-8", errors="replace").strip()
 
         if task.phase == "completed":
+            self.append_event(task.id, "state_change", "System", "Continuation completed successfully.")
             message = f"Task {task.id} completed.\n\n{final or 'Final response is empty.'}"
-            reply_markup = completed_task_keyboard(task.id) if task.codex_session_id else None
+            if post_snapshot.is_dirty:
+                message += f"\n\nSafety: {snapshot_summary(post_snapshot)}"
+            reply_markup = completed_task_keyboard(task.id)
         else:
+            self.append_event(task.id, "state_change", "System", f"Continuation failed: {task.error}")
             log_tail = tail_file(task.run_log_path, max_lines=60)
             message = (
                 f"Task {task.id} failed: {task.error}\n\n"
                 f"Final:\n{final or '-'}\n\nLog tail:\n{log_tail}"
             )
-            reply_markup = None
+            reply_markup = failed_task_keyboard(task.id)
         self.send(task.chat_id, message, reply_markup=reply_markup)
 
     def cancel_task(self, chat_id: int, task_id: str) -> None:
@@ -2303,6 +3189,8 @@ class CodexTelegramBot:
         task.error = "Canceled by user."
         task.pid = None
         self.store.save_task(task)
+        self.append_event(task.id, "state_change", "System", "Task cancelled by user.")
+        self.remember_task_context(task, "status")
         state = self.store.load_chat_state(chat_id)
         if (
             pending_task_id(state.pending_action, "attach_files") == task.id
@@ -2316,6 +3204,133 @@ class CodexTelegramBot:
             state.pending_action = None
             self.store.save_chat_state(state)
         self.send(chat_id, f"Task {task.id} canceled.")
+
+    def handle_task_callback(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        action: str,
+        task_id: str,
+    ) -> None:
+        task = self.recent_context_task(chat_id, task_id)
+        if task is None:
+            self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
+            return
+        if action == "brain":
+            self.show_task_brain(chat_id, task.id)
+        elif action == "plan":
+            self.show_task_plan(chat_id, task.id)
+        elif action == "status":
+            self.show_task(chat_id, task.id)
+        elif action == "logs":
+            self.logs(chat_id, task.id)
+        elif action == "safety":
+            self.show_task_safety(chat_id, task.id)
+        elif action == "review":
+            self.show_task_review(chat_id, task.id)
+        elif action == "execute":
+            self.confirm_task(chat_id, task.id)
+        elif action == "continue":
+            self.start_continue_input(chat_id, task.id)
+        elif action == "cancel":
+            self.cancel_task(chat_id, task.id)
+        elif action == "files":
+            self.start_file_attachment_input(chat_id, task.id)
+        elif action == "answer":
+            self.start_answer_input(chat_id, task.id)
+        elif action == "remember":
+            self.propose_task_memory(chat_id, user_id, task.id)
+
+    def show_task_brain(self, chat_id: int, task_id: str) -> None:
+        task = self.recent_context_task(chat_id, task_id)
+        if task is None:
+            self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
+            return
+        events = self.events.list_events(task.id, limit=50)
+        self.set_last_view(chat_id, "brain")
+        self.remember_task_context(task, "brain")
+        self.send(
+            chat_id,
+            render_task_events(task.id, events),
+            reply_markup=self.task_view_keyboard(task),
+        )
+
+    def show_task_plan(self, chat_id: int, task_id: str) -> None:
+        task = self.recent_context_task(chat_id, task_id)
+        if task is None:
+            self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
+            return
+        plan = task.plan_text.strip() or f"Plan is not available yet. Phase: {task.phase}"
+        self.set_last_view(chat_id, "plan")
+        self.remember_task_context(task, "plan")
+        self.send(chat_id, f"📋 План {task.id}:\n\n{plan[:3500]}", reply_markup=self.task_view_keyboard(task))
+
+    def show_task_safety(self, chat_id: int, task_id: str) -> None:
+        task = self.recent_context_task(chat_id, task_id)
+        if task is None:
+            self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
+            return
+        task_dir = self.store.task_dir(task.id)
+        snapshots = [
+            snapshot
+            for snapshot in [
+                read_git_snapshot(task_dir, "pre-execution"),
+                read_git_snapshot(task_dir, "post-execution"),
+            ]
+            if snapshot is not None
+        ]
+        if not snapshots:
+            current = capture_git_snapshot(task.project_path, "current")
+            snapshots = [current]
+        lines = [f"🛡 Safety for {task.id}"]
+        for snapshot in snapshots:
+            lines.extend(["", f"{snapshot.label}: {snapshot_summary(snapshot)}"])
+            if snapshot.status_short:
+                lines.append("Status:")
+                lines.append(snapshot.status_short[:1200])
+            if snapshot.diff_stat:
+                lines.append("Diff stat:")
+                lines.append(snapshot.diff_stat[:1200])
+            if snapshot.error:
+                lines.append(f"Git note: {snapshot.error[:500]}")
+        self.set_last_view(chat_id, "safety")
+        self.remember_task_context(task, "safety")
+        self.send(chat_id, "\n".join(lines)[:4000], reply_markup=self.task_view_keyboard(task))
+
+    def show_task_review(self, chat_id: int, task_id: str) -> None:
+        task = self.recent_context_task(chat_id, task_id)
+        if task is None:
+            self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
+            return
+        self.append_event(task.id, "review", "Reviewer", "Review requested from Telegram UI.")
+        self.set_last_view(chat_id, "review")
+        self.remember_task_context(task, "review")
+        self.send(
+            chat_id,
+            f"🔍 Review for {task.id}\nReview role is prepared as metadata. Automated reviewer execution is not enabled in this increment.",
+            reply_markup=self.task_view_keyboard(task),
+        )
+
+    def task_view_keyboard(self, task: TaskRecord) -> dict[str, Any]:
+        return task_progress_keyboard(task.id, task.phase)
+
+    def record_git_safety_snapshot(self, task: TaskRecord, label: str) -> GitSnapshot:
+        snapshot = capture_git_snapshot(task.project_path, label)
+        path = write_git_snapshot(self.store.task_dir(task.id), snapshot)
+        self.append_event(
+            task.id,
+            "safety",
+            "Safety",
+            snapshot_summary(snapshot),
+            {
+                "label": label,
+                "artifact_path": str(path),
+                "is_git_repo": snapshot.is_git_repo,
+                "branch": snapshot.branch,
+                "dirty_files": snapshot.dirty_files,
+            },
+        )
+        return snapshot
 
     def show_tasks(self, chat_id: int, status_filter: str) -> None:
         phases = TASK_FILTERS.get(status_filter)
@@ -2373,33 +3388,12 @@ class CodexTelegramBot:
         ]
         for attachment in task.attachments[:5]:
             lines.append(f"- {attachment.get('file_name', 'attachment')}")
-        rows: list[list[dict[str, str]]] = []
-        full_keyboard = False
+        self.remember_task_context(task, "status")
         if task.kind == "followup_task" and task.parent_task_id and task.phase == "created":
-            rows.extend(followup_draft_keyboard(task.parent_task_id, task.id)["inline_keyboard"])
-            full_keyboard = True
-        elif task.phase == "planned":
-            rows.append(
-                [
-                    {"text": "Execute", "callback_data": f"confirm:{task.id}"},
-                    {"text": "Answer clarification", "callback_data": f"answer:{task.id}"},
-                ]
-            )
-            rows.append(
-                [
-                    {"text": "Add files", "callback_data": f"attach:{task.id}"},
-                    {"text": "Cancel", "callback_data": f"cancel:{task.id}"},
-                ]
-            )
-        elif task.phase in {"planning", "running", "agent_running"}:
-            rows.append([{"text": "Cancel", "callback_data": f"cancel:{task.id}"}])
-        elif task.phase == "completed":
-            rows.extend(completed_task_keyboard(task.id)["inline_keyboard"])
-            full_keyboard = True
-        if not full_keyboard:
-            rows.append([{"text": "Logs", "callback_data": f"logs:{task.id}"}, {"text": "Tasks", "callback_data": "tasks:active"}])
-            rows.append([{"text": "Menu", "callback_data": "menu"}])
-        self.send(chat_id, "\n".join(lines), reply_markup={"inline_keyboard": rows})
+            reply_markup = followup_draft_keyboard(task.parent_task_id, task.id)
+        else:
+            reply_markup = self.task_view_keyboard(task)
+        self.send(chat_id, "\n".join(lines), reply_markup=reply_markup)
 
     def status(self, chat_id: int, task_id: str) -> None:
         if task_id:
@@ -2430,7 +3424,13 @@ class CodexTelegramBot:
             return
 
         log_path = task.run_log_path or task.plan_log_path
-        self.send(chat_id, f"Log tail for {task.id}:\n\n{tail_file(log_path)}")
+        self.set_last_view(chat_id, "logs")
+        self.remember_task_context(task, "logs")
+        self.send(
+            chat_id,
+            f"Log tail for {task.id}:\n\n{tail_file(log_path)}",
+            reply_markup=self.task_view_keyboard(task),
+        )
 
     def run(self) -> None:
         self.load_or_build_index()
@@ -2439,6 +3439,7 @@ class CodexTelegramBot:
         self.recover_interrupted_tasks()
         self.resume_prompt_drafts()
         self.start_slack_watcher()
+        self.start_slack_desktop_watcher()
 
         while not self.stop_event.is_set():
             try:

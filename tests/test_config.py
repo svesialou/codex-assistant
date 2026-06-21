@@ -120,6 +120,37 @@ EMPTY=
         with self.assertRaisesRegex(ValueError, "CODEX_TELEGRAM_ALLOWED_USER_IDS"):
             config.validate_for_bot()
 
+    def test_slack_desktop_notifications_work_without_api_token(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertFalse(config.slack_enabled())
+        self.assertTrue(config.slack_desktop_enabled())
+        self.assertEqual(config.slack_target_chat_ids, {123})
+
+    def test_slack_desktop_notifications_can_be_disabled(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+                "CODEX_SLACK_DESKTOP_NOTIFICATIONS": "0",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertFalse(config.slack_desktop_enabled())
+
 
 if __name__ == "__main__":
     unittest.main()

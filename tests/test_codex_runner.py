@@ -11,9 +11,11 @@ from codex_telegram_bot.codex_runner import (
     extract_session_id,
     interrupted_execution_prompt,
     planning_prompt,
+    read_task_context,
     read_text_tail,
 )
 from codex_telegram_bot.config import Config
+from codex_telegram_bot.project_index import ProjectInfo
 from codex_telegram_bot.task_store import TaskRecord, TaskStore
 
 
@@ -77,6 +79,43 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn("/tmp/task/report.txt", continuation)
         self.assertIn("input data", run_prompt)
         self.assertIn("input data", continuation)
+
+    def test_read_task_context_includes_active_project_contexts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            index_dir = Path(tmp) / "index"
+            agents_dir = index_dir / "agents"
+            agents_dir.mkdir(parents=True)
+            (agents_dir / "demo.md").write_text("Demo context", encoding="utf-8")
+            (agents_dir / "api.md").write_text("API context", encoding="utf-8")
+            project = ProjectInfo(
+                slug="demo",
+                name="demo",
+                path="/tmp/demo",
+                base="/tmp",
+                is_git=False,
+                branch=None,
+                origin=None,
+                languages=[],
+                markers=[],
+                docs=[],
+                test_hints=[],
+            )
+            task = TaskRecord(
+                id="task-1",
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="do work",
+                context_project_slugs=["demo", "api"],
+            )
+
+            context = read_task_context(index_dir, task, project)
+
+        self.assertIn("Active projects: demo, api", context)
+        self.assertIn("Demo context", context)
+        self.assertIn("API context", context)
 
     def test_direct_execution_prompt_records_planning_was_skipped(self) -> None:
         task = TaskRecord(

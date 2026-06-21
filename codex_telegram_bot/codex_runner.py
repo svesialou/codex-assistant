@@ -25,6 +25,39 @@ def read_context(index_dir: Path, project_slug: str, max_chars: int = 12000) -> 
     return text[:max_chars].rstrip() + "\n..."
 
 
+def task_context_slugs(task: TaskRecord, primary_slug: str) -> list[str]:
+    slugs: list[str] = []
+    for slug in [primary_slug, *task.context_project_slugs]:
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs or [primary_slug]
+
+
+def read_task_context(
+    index_dir: Path,
+    task: TaskRecord,
+    primary_project: ProjectInfo,
+    max_chars: int = 20000,
+) -> str:
+    slugs = task_context_slugs(task, primary_project.slug)
+    if len(slugs) == 1:
+        return read_context(index_dir, slugs[0])
+
+    per_project_limit = max(2000, max_chars // len(slugs))
+    sections = [
+        "# Active Development Context",
+        "",
+        f"- Primary project: `{primary_project.slug}`",
+        f"- Active projects: {', '.join(slugs)}",
+    ]
+    for slug in slugs:
+        context = read_context(index_dir, slug, max_chars=per_project_limit)
+        if not context:
+            continue
+        sections.extend(["", f"## Project Context: {slug}", "", context.rstrip()])
+    return "\n".join(sections).rstrip() + "\n"
+
+
 def attachment_context(task: TaskRecord) -> str:
     if not task.attachments:
         return "- none"
@@ -397,7 +430,7 @@ class CodexRunner:
         task.plan_log_path = str(log_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(planning_prompt(task, context), encoding="utf-8")
 
         command = self._base_command(task.project_path, plan_path)
@@ -446,7 +479,7 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
         command = self._base_command(task.project_path, final_path)
@@ -503,7 +536,7 @@ class CodexRunner:
             task.codex_session_id = extract_session_id(log_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(
             interrupted_execution_prompt(
                 task,
@@ -569,7 +602,7 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         parent_task = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
         prompt_path.write_text(
             continuation_prompt(task, context, parent_task),
@@ -621,7 +654,7 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(agent_chat_prompt(task, context), encoding="utf-8")
 
         command = self._base_command(task.project_path, final_path)

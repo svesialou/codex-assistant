@@ -24,6 +24,11 @@ SYSTEMD_USER_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 SERVICE_FILE="${SYSTEMD_USER_DIR}/${SERVICE_NAME}"
 WATCHDOG_SERVICE_FILE="${SYSTEMD_USER_DIR}/${WATCHDOG_SERVICE_NAME}"
 WATCHDOG_TIMER_FILE="${SYSTEMD_USER_DIR}/${WATCHDOG_TIMER_NAME}"
+NETWORK_WATCHDOG="${CODEX_NETWORK_WATCHDOG:-${CODEX_HOME}/scripts/codex-network-watchdog.sh}"
+NETWORK_WATCHDOG_SERVICE_NAME="codex-network-watchdog.service"
+NETWORK_WATCHDOG_TIMER_NAME="codex-network-watchdog.timer"
+NETWORK_WATCHDOG_SERVICE_FILE="${SYSTEMD_USER_DIR}/${NETWORK_WATCHDOG_SERVICE_NAME}"
+NETWORK_WATCHDOG_TIMER_FILE="${SYSTEMD_USER_DIR}/${NETWORK_WATCHDOG_TIMER_NAME}"
 REPO_FILE="${CODEX_ASSISTANT_REPO_FILE:-${CODEX_HOME}/codex-assistant.repo}"
 DEFAULT_REPO="${HOME}/Projects/codex-assistant"
 RUN_MODE="${CODEX_TELEGRAM_RUN_MODE:-auto}"
@@ -135,6 +140,10 @@ watchdog_known() {
   systemd_available && systemctl --user cat "${WATCHDOG_TIMER_NAME}" >/dev/null 2>&1
 }
 
+network_watchdog_known() {
+  systemd_available && systemctl --user cat "${NETWORK_WATCHDOG_TIMER_NAME}" >/dev/null 2>&1
+}
+
 inside_service_cgroup() {
   [ -r "/proc/$$/cgroup" ] && grep -Fq "/${SERVICE_NAME}" "/proc/$$/cgroup"
 }
@@ -203,6 +212,61 @@ TIMER
   systemctl --user daemon-reload
   echo "installed ${WATCHDOG_SERVICE_FILE}"
   echo "installed ${WATCHDOG_TIMER_FILE}"
+}
+
+write_network_watchdog_files() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  if [ ! -x "${NETWORK_WATCHDOG}" ]; then
+    echo "network watchdog script is not executable: ${NETWORK_WATCHDOG}" >&2
+    return 1
+  fi
+
+  mkdir -p "${SYSTEMD_USER_DIR}"
+  cat >"${NETWORK_WATCHDOG_SERVICE_FILE}" <<SERVICE
+[Unit]
+Description=Codex internet connectivity watchdog
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.codex/scripts/codex-network-watchdog.sh watchdog
+Environment=PYTHONUNBUFFERED=1
+SERVICE
+
+  cat >"${NETWORK_WATCHDOG_TIMER_FILE}" <<TIMER
+[Unit]
+Description=Check internet connectivity every minute
+
+[Timer]
+OnStartupSec=20s
+OnUnitActiveSec=1min
+AccuracySec=10s
+Unit=${NETWORK_WATCHDOG_SERVICE_NAME}
+
+[Install]
+WantedBy=timers.target
+TIMER
+
+  systemctl --user daemon-reload
+  echo "installed ${NETWORK_WATCHDOG_SERVICE_FILE}"
+  echo "installed ${NETWORK_WATCHDOG_TIMER_FILE}"
+}
+
+run_network_watchdog() {
+  if [ ! -x "${NETWORK_WATCHDOG}" ]; then
+    return 0
+  fi
+
+  if systemd_available && systemctl --user is-active --quiet "${NETWORK_WATCHDOG_TIMER_NAME}"; then
+    return 0
+  fi
+
+  "${NETWORK_WATCHDOG}" watchdog || true
 }
 
 schedule_deferred_systemd_restart() {
@@ -406,6 +470,12 @@ enable_watchdog() {
   echo "enabled ${WATCHDOG_TIMER_NAME}"
 }
 
+enable_network_watchdog() {
+  write_network_watchdog_files
+  systemctl --user enable --now "${NETWORK_WATCHDOG_TIMER_NAME}"
+  echo "enabled ${NETWORK_WATCHDOG_TIMER_NAME}"
+}
+
 disable_watchdog() {
   if ! systemd_available; then
     echo "systemd --user is not available in this session" >&2
@@ -418,7 +488,64 @@ disable_watchdog() {
   echo "disabled ${WATCHDOG_TIMER_NAME}"
 }
 
+disable_network_watchdog() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  systemctl --user disable --now "${NETWORK_WATCHDOG_TIMER_NAME}" 2>/dev/null || true
+  systemctl --user stop "${NETWORK_WATCHDOG_SERVICE_NAME}" 2>/dev/null || true
+  systemctl --user daemon-reload
+  echo "disabled ${NETWORK_WATCHDOG_TIMER_NAME}"
+}
+
+network_watchdog_status() {
+  if ! systemd_available; then
+    echo "systemd --user is not available in this session" >&2
+    return 1
+  fi
+
+  if network_watchdog_known; then
+    systemctl --user --no-pager --full status "${NETWORK_WATCHDOG_TIMER_NAME}"
+    systemctl --user --no-pager --full status "${NETWORK_WATCHDOG_SERVICE_NAME}" || true
+    systemctl --user list-timers --all "${NETWORK_WATCHDOG_TIMER_NAME}" --no-pager
+  else
+    echo "codex network watchdog is not installed"
+    return 1
+  fi
+}
+
+network_watchdog_check() {
+  if [ ! -x "${NETWORK_WATCHDOG}" ]; then
+    echo "network watchdog script is not executable: ${NETWORK_WATCHDOG}" >&2
+    return 1
+  fi
+
+  "${NETWORK_WATCHDOG}" watchdog
+}
+
+network_status() {
+  if [ ! -x "${NETWORK_WATCHDOG}" ]; then
+    echo "network watchdog script is not executable: ${NETWORK_WATCHDOG}" >&2
+    return 1
+  fi
+
+  "${NETWORK_WATCHDOG}" status
+}
+
+network_reconnect() {
+  if [ ! -x "${NETWORK_WATCHDOG}" ]; then
+    echo "network watchdog script is not executable: ${NETWORK_WATCHDOG}" >&2
+    return 1
+  fi
+
+  "${NETWORK_WATCHDOG}" reconnect-now
+}
+
 watchdog_check() {
+  run_network_watchdog
+
   if docker_mode; then
     if docker_status >/dev/null 2>&1; then
       echo "codex telegram bot docker service is running"
@@ -478,8 +605,9 @@ enable_service() {
   fi
   write_service_file
   systemctl --user enable --now "${SERVICE_NAME}"
+  enable_network_watchdog
   enable_watchdog
-  echo "enabled and started ${SERVICE_NAME} with watchdog timer"
+  echo "enabled and started ${SERVICE_NAME} with bot and network watchdog timers"
 }
 
 disable_service() {
@@ -495,9 +623,11 @@ disable_service() {
 
   systemctl --user disable --now "${WATCHDOG_TIMER_NAME}" 2>/dev/null || true
   systemctl --user stop "${WATCHDOG_SERVICE_NAME}" 2>/dev/null || true
+  systemctl --user disable --now "${NETWORK_WATCHDOG_TIMER_NAME}" 2>/dev/null || true
+  systemctl --user stop "${NETWORK_WATCHDOG_SERVICE_NAME}" 2>/dev/null || true
   systemctl --user disable --now "${SERVICE_NAME}" 2>/dev/null || true
   systemctl --user daemon-reload
-  echo "disabled ${SERVICE_NAME} and ${WATCHDOG_TIMER_NAME}"
+  echo "disabled ${SERVICE_NAME}, ${WATCHDOG_TIMER_NAME}, and ${NETWORK_WATCHDOG_TIMER_NAME}"
 }
 
 case "${1:-status}" in
@@ -528,6 +658,27 @@ case "${1:-status}" in
   watchdog-disable)
     disable_watchdog
     ;;
+  network-watchdog-install)
+    write_network_watchdog_files
+    ;;
+  network-watchdog-enable)
+    enable_network_watchdog
+    ;;
+  network-watchdog-disable)
+    disable_network_watchdog
+    ;;
+  network-watchdog-check)
+    network_watchdog_check
+    ;;
+  network-watchdog-status)
+    network_watchdog_status
+    ;;
+  network-status)
+    network_status
+    ;;
+  network-reconnect)
+    network_reconnect
+    ;;
   watchdog-check)
     watchdog_check
     ;;
@@ -550,7 +701,7 @@ case "${1:-status}" in
     docker_log "${2:-80}"
     ;;
   *)
-    echo "Usage: $0 start|stop|restart|status|log [lines]|install|enable|autostart|disable|watchdog-install|watchdog-enable|watchdog-disable|watchdog-check|watchdog-status|systemd-status|docker-status|docker-logs [lines]" >&2
+    echo "Usage: $0 start|stop|restart|status|log [lines]|install|enable|autostart|disable|watchdog-install|watchdog-enable|watchdog-disable|watchdog-check|watchdog-status|network-watchdog-install|network-watchdog-enable|network-watchdog-disable|network-watchdog-check|network-watchdog-status|network-status|network-reconnect|systemd-status|docker-status|docker-logs [lines]" >&2
     exit 2
     ;;
 esac

@@ -5,7 +5,7 @@ import os
 import secrets
 import signal
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ class TaskRecord:
     project_name: str
     project_path: str
     prompt: str
+    context_project_slugs: list[str] = field(default_factory=list)
     kind: str = "task"
     source: str = "text"
     source_path: str = ""
@@ -53,7 +54,8 @@ class TaskRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,20 +65,33 @@ class TaskRecord:
 class ChatState:
     chat_id: int
     selected_project_slug: str | None = None
+    active_project_slugs: list[str] = field(default_factory=list)
     agent_mode: bool = False
+    agent_conversation_mode: bool = True
     pending_action: str | None = None
     prompt_draft_action: str | None = None
     prompt_draft_user_id: int | None = None
     prompt_draft_project_slug: str | None = None
+    prompt_draft_context_project_slugs: list[str] = field(default_factory=list)
     prompt_draft_parts: list[str] = field(default_factory=list)
     prompt_draft_source: str = "text"
     prompt_draft_source_path: str = ""
     prompt_draft_version: int = 0
+    last_task_id: str = ""
+    last_planned_task_id: str = ""
+    last_completed_task_id: str = ""
+    last_task_with_session_id: str = ""
+    last_shown_view: str = ""
+    pending_memory_project_slug: str = ""
+    pending_memory_text: str = ""
+    pending_alias_name: str = ""
+    pending_alias_project_slug: str = ""
     updated_at: str = field(default_factory=now_iso)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ChatState":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +113,7 @@ class TaskStore:
         project_name: str,
         project_path: str,
         prompt: str,
+        context_project_slugs: list[str] | None = None,
         kind: str = "task",
         source: str = "text",
         source_path: str = "",
@@ -113,6 +129,7 @@ class TaskStore:
             project_name=project_name,
             project_path=project_path,
             prompt=prompt,
+            context_project_slugs=list(context_project_slugs or [project_slug]),
             kind=kind,
             source=source,
             source_path=source_path,

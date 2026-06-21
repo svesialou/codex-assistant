@@ -126,6 +126,7 @@ class Config:
     slack_poll_interval_seconds: int = 60
     slack_history_limit: int = 20
     slack_target_chat_ids: set[int] = field(default_factory=set)
+    slack_desktop_notifications: bool = True
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -209,6 +210,10 @@ class Config:
                 int(env.get("CODEX_SLACK_HISTORY_LIMIT", "20")),
             ),
             slack_target_chat_ids=slack_target_chat_ids,
+            slack_desktop_notifications=parse_bool(
+                env.get("CODEX_SLACK_DESKTOP_NOTIFICATIONS"),
+                True,
+            ),
         )
 
     def slack_enabled(self) -> bool:
@@ -217,6 +222,9 @@ class Config:
             and self.slack_target_chat_ids
             and (self.slack_watch_dms or self.slack_channel_ids)
         )
+
+    def slack_desktop_enabled(self) -> bool:
+        return bool(self.slack_desktop_notifications and self.slack_target_chat_ids)
 
     def validate_for_bot(self) -> None:
         if not self.bot_token:

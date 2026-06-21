@@ -15,4 +15,4 @@ codex-telegram-bot = "codex_telegram_bot.bot:main"
 codex-project-index = "codex_telegram_bot.project_index:main"
 
 [tool.setuptools]
-packages = ["codex_telegram_bot"]
+packages = ["codex_telegram_bot", "codex_telegram_bot.services"]

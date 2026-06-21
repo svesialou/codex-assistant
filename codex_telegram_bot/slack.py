@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import ast
+import hashlib
 import html
 import json
 import logging
+import select
+import subprocess
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from threading import Event
@@ -16,6 +20,14 @@ from typing import Any
 
 LOG = logging.getLogger("codex_telegram_bot.slack")
 SLACK_API_BASE = "https://slack.com/api"
+DBUS_NOTIFY_MONITOR_COMMAND = (
+    "dbus-monitor",
+    "--session",
+    "interface='org.freedesktop.Notifications',member='Notify'",
+)
+DBUS_NOTIFY_RESTART_DELAY_SECONDS = 5
+MAX_SLACK_NOTIFIED_MESSAGE_IDS = 500
+MAX_SLACK_DESKTOP_FINGERPRINTS = 200
 SKIPPED_MESSAGE_SUBTYPES = {
     "channel_archive",
     "channel_join",
@@ -58,6 +70,7 @@ class SlackState:
     initialized: bool = False
     last_poll_ts: str = ""
     channel_last_seen: dict[str, str] = field(default_factory=dict)
+    notified_message_ids: list[str] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SlackState":
@@ -69,6 +82,11 @@ class SlackState:
                 for channel, ts in (data.get("channel_last_seen") or {}).items()
                 if channel and ts
             },
+            notified_message_ids=[
+                str(message_id)
+                for message_id in data.get("notified_message_ids") or []
+                if message_id
+            ][-MAX_SLACK_NOTIFIED_MESSAGE_IDS:],
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -92,6 +110,51 @@ class SlackStateStore:
         tmp = self.path.with_suffix(".json.tmp")
         tmp.write_text(
             json.dumps(state.to_dict(), ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        tmp.replace(self.path)
+
+
+class SlackDesktopNotificationStore:
+    def __init__(self, state_dir: Path) -> None:
+        self.path = state_dir / "slack" / "desktop_notifications.json"
+
+    def mark_seen(self, fingerprint: str) -> bool:
+        fingerprints = self.load()
+        if fingerprint in fingerprints:
+            return False
+
+        fingerprints = append_recent_unique(
+            fingerprints,
+            fingerprint,
+            MAX_SLACK_DESKTOP_FINGERPRINTS,
+        )
+        self.save(fingerprints)
+        return True
+
+    def load(self) -> list[str]:
+        if not self.path.exists():
+            return []
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, TypeError):
+            return []
+        return [
+            str(fingerprint)
+            for fingerprint in payload.get("fingerprints") or []
+            if fingerprint
+        ][-MAX_SLACK_DESKTOP_FINGERPRINTS:]
+
+    def save(self, fingerprints: list[str]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".json.tmp")
+        tmp.write_text(
+            json.dumps(
+                {"fingerprints": fingerprints[-MAX_SLACK_DESKTOP_FINGERPRINTS:]},
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
             encoding="utf-8",
         )
         tmp.replace(self.path)
@@ -239,6 +302,7 @@ class SlackWatcher:
         poll_started_ts = slack_time(self.clock())
         initializing = not state.initialized
         notifications: list[SlackNotification] = []
+        notified_message_ids = set(state.notified_message_ids)
 
         for channel in self.watched_channels():
             last_seen = state.channel_last_seen.get(channel.id)
@@ -264,9 +328,18 @@ class SlackWatcher:
                 ts = str(message.get("ts") or "")
                 if floor_ts and not slack_ts_gt(ts, floor_ts):
                     continue
+                message_id = slack_message_id(channel.id, ts)
+                if message_id in notified_message_ids:
+                    continue
                 if not self.should_notify(channel, message, self_user_id):
                     continue
                 notifications.append(self.build_notification(channel, message))
+                notified_message_ids.add(message_id)
+                state.notified_message_ids = append_recent_unique(
+                    state.notified_message_ids,
+                    message_id,
+                    MAX_SLACK_NOTIFIED_MESSAGE_IDS,
+                )
 
             if newest_ts:
                 state.channel_last_seen[channel.id] = max_slack_ts(last_seen, newest_ts)
@@ -408,6 +481,104 @@ class SlackWatcher:
         return self._user_cache[user_id]
 
 
+class SlackDesktopNotificationWatcher:
+    def __init__(
+        self,
+        monitor_command: tuple[str, ...] = DBUS_NOTIFY_MONITOR_COMMAND,
+        restart_delay_seconds: int = DBUS_NOTIFY_RESTART_DELAY_SECONDS,
+        state_store: SlackDesktopNotificationStore | None = None,
+    ) -> None:
+        self.monitor_command = monitor_command
+        self.restart_delay_seconds = restart_delay_seconds
+        self.state_store = state_store
+
+    def run(
+        self,
+        stop_event: Event,
+        send_notification: Callable[[SlackNotification], None],
+    ) -> None:
+        while not stop_event.is_set():
+            process: subprocess.Popen[str] | None = None
+            try:
+                process = subprocess.Popen(
+                    self.monitor_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                )
+                self._read_monitor(process, stop_event, send_notification)
+            except FileNotFoundError:
+                LOG.warning("slack desktop watcher disabled: dbus-monitor is not available")
+                return
+            except Exception:
+                LOG.exception("slack desktop watcher failed")
+            finally:
+                if process is not None:
+                    self._terminate(process)
+
+            if not stop_event.is_set():
+                stop_event.wait(self.restart_delay_seconds)
+
+    def _read_monitor(
+        self,
+        process: subprocess.Popen[str],
+        stop_event: Event,
+        send_notification: Callable[[SlackNotification], None],
+    ) -> None:
+        if process.stdout is None:
+            return
+
+        block: list[str] = []
+        while not stop_event.is_set():
+            line = read_monitor_line(process)
+            if line is None:
+                if process.poll() is not None:
+                    break
+                continue
+            if line == "":
+                break
+
+            if is_dbus_notify_header(line):
+                self._emit_block(block, send_notification)
+                block = [line]
+                continue
+            if block:
+                block.append(line)
+
+        self._emit_block(block, send_notification)
+        return_code = process.poll()
+        if return_code not in (None, 0) and not stop_event.is_set():
+            LOG.warning("slack desktop watcher exited: return_code=%s", return_code)
+
+    def _emit_block(
+        self,
+        block: Sequence[str],
+        send_notification: Callable[[SlackNotification], None],
+    ) -> None:
+        notification = slack_desktop_notification_from_dbus_block(block)
+        if notification is None:
+            return
+        if self.state_store is not None:
+            fingerprint = slack_notification_fingerprint(notification)
+            if not self.state_store.mark_seen(fingerprint):
+                return
+        send_notification(notification)
+
+    @staticmethod
+    def _terminate(process: subprocess.Popen[str]) -> None:
+        if process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
 def render_slack_notification(notification: SlackNotification) -> str:
     lines = [
         notification.title,
@@ -419,6 +590,119 @@ def render_slack_notification(notification: SlackNotification) -> str:
     if notification.permalink:
         lines.extend(["", notification.permalink])
     return "\n".join(lines)
+
+
+def slack_desktop_notification_from_dbus_block(
+    lines: Sequence[str],
+) -> SlackNotification | None:
+    if not any(is_dbus_notify_header(line) for line in lines):
+        return None
+
+    strings = [
+        value
+        for line in lines
+        if (value := parse_dbus_string_line(line)) is not None
+    ]
+    if len(strings) < 4:
+        return None
+
+    app_name, app_icon, summary, body = strings[:4]
+    if not is_slack_desktop_notification(app_name, app_icon, lines):
+        return None
+
+    sender = slack_desktop_sender(summary)
+    text = clean_desktop_notification_text(body) or "Notification has no text."
+    return SlackNotification(
+        title="Slack tray notification",
+        sender=sender,
+        channel_name="system tray",
+        text=text,
+        permalink="",
+    )
+
+
+def read_monitor_line(process: subprocess.Popen[str]) -> str | None:
+    if process.stdout is None:
+        return ""
+    readable, _, _ = select.select([process.stdout], [], [], 1.0)
+    if not readable:
+        return None
+    return process.stdout.readline()
+
+
+def is_dbus_notify_header(line: str) -> bool:
+    return (
+        "interface=org.freedesktop.Notifications" in line
+        and "member=Notify" in line
+    )
+
+
+def parse_dbus_string_line(line: str) -> str | None:
+    stripped = line.strip()
+    if not stripped.startswith('string "'):
+        return None
+    raw_value = stripped[len("string ") :]
+    try:
+        value = ast.literal_eval(raw_value)
+    except (SyntaxError, ValueError):
+        return raw_value.strip('"')
+    return str(value)
+
+
+def is_slack_desktop_notification(
+    app_name: str,
+    app_icon: str,
+    lines: Sequence[str],
+) -> bool:
+    if "slack" in app_name.lower() or "slack" in app_icon.lower():
+        return True
+
+    for index, line in enumerate(lines):
+        if 'string "desktop-entry"' not in line.lower():
+            continue
+        hint = "\n".join(lines[index : index + 4]).lower()
+        if "slack" in hint:
+            return True
+    return False
+
+
+def slack_desktop_sender(summary: str) -> str:
+    sender = clean_desktop_notification_text(summary)
+    for prefix in ("New message from ", "Message from "):
+        if sender.lower().startswith(prefix.lower()):
+            sender = sender[len(prefix) :].strip()
+            break
+    return sender or "Slack"
+
+
+def clean_desktop_notification_text(value: str) -> str:
+    return html.unescape(value.replace("\x00", "")).strip()
+
+
+def slack_message_id(channel_id: str, message_ts: str) -> str:
+    return f"{channel_id}:{message_ts}"
+
+
+def slack_notification_fingerprint(notification: SlackNotification) -> str:
+    payload = json.dumps(
+        {
+            "title": notification.title,
+            "sender": notification.sender,
+            "channel_name": notification.channel_name,
+            "text": notification.text,
+            "permalink": notification.permalink,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def append_recent_unique(values: list[str], value: str, limit: int) -> list[str]:
+    result = [item for item in values if item != value]
+    result.append(value)
+    return result[-limit:]
 
 
 def notification_title(channel: SlackChannel) -> str:

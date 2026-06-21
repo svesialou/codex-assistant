@@ -15,6 +15,7 @@ from codex_telegram_bot.bot import (
     inline_task_keyboard,
     main_menu_keyboard,
     process_summary,
+    running_task_keyboard,
     tasks_keyboard,
 )
 from codex_telegram_bot.config import Config
@@ -107,8 +108,8 @@ class BotUiTest(unittest.TestCase):
         keyboard = main_menu_keyboard(agent_mode=True)
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
         self.assertIn("Agent: on", labels)
-        self.assertIn("Processes", labels)
-        self.assertIn("Run task", labels)
+        self.assertIn("📊 Статус", labels)
+        self.assertIn("▶️ Run task", labels)
 
     def test_bot_commands_include_menu_first(self) -> None:
         self.assertEqual(BOT_COMMANDS[0]["command"], "menu")
@@ -135,9 +136,10 @@ class BotUiTest(unittest.TestCase):
             for button in row
         ]
 
-        self.assertIn("attach:task-1", callbacks)
-        self.assertIn("answer:task-1", callbacks)
-        self.assertIn("confirm:task-1", callbacks)
+        self.assertIn("task:files:task-1", callbacks)
+        self.assertIn("task:answer:task-1", callbacks)
+        self.assertIn("task:execute:task-1", callbacks)
+        self.assertIn("task:brain:task-1", callbacks)
 
     def test_completed_task_keyboard_has_continue_action(self) -> None:
         keyboard = completed_task_keyboard("task-1")
@@ -147,10 +149,22 @@ class BotUiTest(unittest.TestCase):
             for button in row
         ]
 
-        self.assertIn("continue:task-1", callbacks)
+        self.assertIn("task:continue:task-1", callbacks)
         self.assertIn("contctx:task-1", callbacks)
         self.assertIn("contattach:task-1", callbacks)
-        self.assertIn("contrun:task-1", callbacks)
+        self.assertIn("task:brain:task-1", callbacks)
+        self.assertIn("task:remember:task-1", callbacks)
+
+    def test_running_task_keyboard_has_clarify_and_stop_actions(self) -> None:
+        keyboard = running_task_keyboard("task-1")
+        callbacks = [
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+
+        self.assertIn("task:answer:task-1", callbacks)
+        self.assertIn("task:cancel:task-1", callbacks)
 
     def test_followup_draft_keyboard_has_context_file_and_run_actions(self) -> None:
         keyboard = followup_draft_keyboard("parent-1", "draft-1")
@@ -213,6 +227,59 @@ class BotUiTest(unittest.TestCase):
             edited = bot.edit_message(10, 42, "same text")
 
         self.assertTrue(edited)
+
+    def test_live_status_edit_keeps_running_task_keyboard(self) -> None:
+        class OneEditStopEvent:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def wait(self, _timeout: float) -> bool:
+                self.calls += 1
+                return self.calls > 1
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            fake_api = FakeTelegramAPI()
+            bot.api = fake_api
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="do work",
+            )
+            task.phase = "running"
+            bot.store.save_task(task)
+
+            original_extract = bot_module.extract_codex_activity
+            original_monotonic = bot_module.time.monotonic
+            monotonic_values = iter([0.0, 10.0, 10.0])
+            bot_module.extract_codex_activity = lambda _path: "Inspecting files"
+            bot_module.time.monotonic = lambda: next(monotonic_values)
+            try:
+                bot.watch_codex_status(
+                    task,
+                    "running",
+                    Path(tmp) / "run.log",
+                    42,
+                    OneEditStopEvent(),
+                )
+            finally:
+                bot_module.extract_codex_activity = original_extract
+                bot_module.time.monotonic = original_monotonic
+
+        self.assertEqual(len(fake_api.edited), 1)
+        reply_markup = fake_api.edited[0][3]
+        self.assertIsNotNone(reply_markup)
+        callbacks = [
+            button["callback_data"]
+            for row in reply_markup["inline_keyboard"]
+            for button in row
+        ]
+        self.assertIn(f"task:answer:{task.id}", callbacks)
+        self.assertIn(f"task:cancel:{task.id}", callbacks)
 
     def test_process_summary_lists_live_processes_across_projects(self) -> None:
         tasks = [
@@ -460,6 +527,49 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(spawned[0][1], (task.id, None))
         self.assertIn("Статус Codex", sent[-1])
         self.assertIn("Уточнение сохранено", sent[-1])
+
+    def test_answer_button_on_running_task_saves_context_without_new_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            fake_api = FakeTelegramAPI()
+            bot.api = fake_api
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="do work",
+            )
+            task.phase = "running"
+            bot.store.save_task(task)
+
+            bot.handle_callback(
+                {
+                    "id": "callback-1",
+                    "data": f"task:answer:{task.id}",
+                    "message": {"message_id": 42, "chat": {"id": 10}},
+                    "from": {"id": 20},
+                }
+            )
+            bot.handle_plain_text(10, 20, "use the current logs as context")
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+            loaded = bot.store.load_task(task.id)
+            loaded_state = bot.store.load_chat_state(10)
+
+        self.assertEqual(len(tasks), 1)
+        self.assertIsNotNone(loaded)
+        self.assertEqual(loaded.clarifications, ["use the current logs as context"])
+        self.assertEqual(loaded.phase, "running")
+        self.assertIsNone(loaded_state.pending_action)
+        self.assertEqual(spawned, [])
+        self.assertIn("Send context for active task", fake_api.sent[0][1])
+        self.assertIn("Контекст сохранен", fake_api.sent[-1][1])
+        self.assertNotIn("Prompt part", fake_api.sent[-1][1])
 
     def test_new_task_text_parts_are_buffered_into_one_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -800,6 +910,121 @@ class BotUiTest(unittest.TestCase):
             prompts = {task.prompt for task in bot.store.recent_tasks(10, limit=10)}
 
         self.assertEqual(prompts, {"user 20 prompt", "user 21 prompt"})
+
+    def test_plain_text_selects_project_by_default_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project("codex-assistant")]
+            sent: list[tuple[str, dict | None]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or 1
+
+            bot.handle_plain_text(10, 20, "Работаем с ботом")
+
+            state = bot.store.load_chat_state(10)
+
+        self.assertEqual(state.selected_project_slug, "codex-assistant")
+        self.assertEqual(state.active_project_slugs, ["codex-assistant"])
+        self.assertIn("активный проект: codex-assistant", sent[-1][0])
+        self.assertIsNotNone(sent[-1][1])
+
+    def test_plain_text_creates_planned_task_with_next_action_buttons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[tuple[str, dict | None]] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or len(sent)
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "demo"
+            state.active_project_slugs = ["demo"]
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "Добавь агентные роли и кнопку мозги")
+            bot.flush_prompt_draft(10)
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+            callbacks = [
+                button["callback_data"]
+                for row in sent[-1][1]["inline_keyboard"]
+                for button in row
+            ]
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].prompt, "Добавь агентные роли и кнопку мозги")
+        self.assertEqual(spawned[0][0].__name__, "plan_task")
+        self.assertIn(f"task:brain:{tasks[0].id}", callbacks)
+        self.assertIn(f"task:plan:{tasks[0].id}", callbacks)
+
+    def test_brain_callback_shows_task_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.api = FakeTelegramAPI()
+            task = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "do work")
+            bot.append_event(task.id, "agent_message", "PM", "Принял задачу")
+
+            bot.handle_callback(
+                {
+                    "id": "callback-1",
+                    "data": f"task:brain:{task.id}",
+                    "message": {"message_id": 42, "chat": {"id": 10}},
+                    "from": {"id": 20},
+                }
+            )
+
+        self.assertIn("Мозги команды", bot.api.sent[-1][1])
+        self.assertIn("PM: Принял задачу", bot.api.sent[-1][1])
+
+    def test_plain_text_confirm_executes_last_planned_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[str] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text) or len(sent)
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "do work")
+            task.phase = "planned"
+            task.plan_text = "Plan"
+            bot.store.save_task(task)
+            state = bot.store.load_chat_state(10)
+            state.last_task_id = task.id
+            state.last_planned_task_id = task.id
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "делай")
+
+        self.assertEqual(spawned[0][0].__name__, "execute_task")
+        self.assertIn("подтверждена", sent[-1])
+
+    def test_plain_text_remember_prompts_for_confirmation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[tuple[str, dict | None]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or 1
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "demo"
+            state.active_project_slugs = ["demo"]
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "Запомни: source repo главный")
+
+            loaded_state = bot.store.load_chat_state(10)
+            callbacks = [
+                button["callback_data"]
+                for row in sent[-1][1]["inline_keyboard"]
+                for button in row
+            ]
+
+        self.assertEqual(loaded_state.pending_memory_project_slug, "demo")
+        self.assertIn("memory:save_pending:demo", callbacks)
+        self.assertIn("source repo главный", sent[-1][0])
 
 
 if __name__ == "__main__":
