@@ -5,7 +5,7 @@ import os
 import secrets
 import signal
 import threading
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -29,6 +29,7 @@ class TaskRecord:
     project_name: str
     project_path: str
     prompt: str
+    context_project_slugs: list[str] = field(default_factory=list)
     kind: str = "task"
     source: str = "text"
     source_path: str = ""
@@ -42,6 +43,21 @@ class TaskRecord:
     run_log_path: str = ""
     final_path: str = ""
     prompt_path: str = ""
+    prepared_codex_prompt: str = ""
+    original_user_request: str = ""
+    normalized_request: str = ""
+    summary: str = ""
+    current_branch: str = ""
+    related_repos: list[str] = field(default_factory=list)
+    files_touched: list[str] = field(default_factory=list)
+    last_diff_summary: str = ""
+    last_run_summary: str = ""
+    next_actions: list[str] = field(default_factory=list)
+    model_routing: dict[str, Any] = field(default_factory=dict)
+    memory_refs: list[str] = field(default_factory=list)
+    trace_id: str = ""
+    orchestrator_enabled: bool = False
+    orchestrator_review_rounds: int = 0
     pid: int | None = None
     pid_start_time: str = ""
     runtime_id: str = ""
@@ -53,7 +69,8 @@ class TaskRecord:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TaskRecord":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -63,20 +80,38 @@ class TaskRecord:
 class ChatState:
     chat_id: int
     selected_project_slug: str | None = None
+    active_project_slugs: list[str] = field(default_factory=list)
     agent_mode: bool = False
+    agent_conversation_mode: bool = True
+    orchestrator_mode: bool | None = None
+    debug_mode: bool = False
+    memory_enabled: bool | None = None
+    orchestrator_default_tier: str = "auto"
     pending_action: str | None = None
     prompt_draft_action: str | None = None
     prompt_draft_user_id: int | None = None
     prompt_draft_project_slug: str | None = None
+    prompt_draft_context_project_slugs: list[str] = field(default_factory=list)
     prompt_draft_parts: list[str] = field(default_factory=list)
     prompt_draft_source: str = "text"
     prompt_draft_source_path: str = ""
+    prompt_draft_manual_tier: str = "auto"
     prompt_draft_version: int = 0
+    last_task_id: str = ""
+    last_planned_task_id: str = ""
+    last_completed_task_id: str = ""
+    last_task_with_session_id: str = ""
+    last_shown_view: str = ""
+    pending_memory_project_slug: str = ""
+    pending_memory_text: str = ""
+    pending_alias_name: str = ""
+    pending_alias_project_slug: str = ""
     updated_at: str = field(default_factory=now_iso)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ChatState":
-        return cls(**data)
+        allowed = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in allowed})
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -98,6 +133,7 @@ class TaskStore:
         project_name: str,
         project_path: str,
         prompt: str,
+        context_project_slugs: list[str] | None = None,
         kind: str = "task",
         source: str = "text",
         source_path: str = "",
@@ -113,6 +149,9 @@ class TaskStore:
             project_name=project_name,
             project_path=project_path,
             prompt=prompt,
+            original_user_request=prompt,
+            normalized_request=" ".join(prompt.strip().split()),
+            context_project_slugs=list(context_project_slugs or [project_slug]),
             kind=kind,
             source=source,
             source_path=source_path,
@@ -191,6 +230,47 @@ class TaskStore:
             tasks.append(task)
         tasks.sort(key=lambda item: item.updated_at, reverse=True)
         return tasks[:limit] if limit is not None else tasks
+
+    def search_tasks(
+        self,
+        query: str,
+        chat_id: int | None = None,
+        project_slug: str | None = None,
+        limit: int = 10,
+    ) -> list[TaskRecord]:
+        tokens = [
+            token
+            for token in query.lower().replace("#", " ").split()
+            if len(token) >= 2
+        ]
+        candidates = self.tasks(
+            limit=None,
+            chat_ids={chat_id} if chat_id is not None else None,
+            project_slug=project_slug,
+        )
+        if not tokens:
+            return candidates[:limit]
+
+        scored: list[tuple[int, TaskRecord]] = []
+        for task in candidates:
+            haystack = " ".join(
+                [
+                    task.id,
+                    task.project_slug,
+                    task.project_name,
+                    task.prompt,
+                    task.summary,
+                    task.last_run_summary,
+                    task.last_diff_summary,
+                    " ".join(task.files_touched),
+                ]
+            ).lower()
+            score = sum(1 for token in tokens if token in haystack)
+            if score:
+                scored.append((score, task))
+
+        scored.sort(key=lambda item: (item[0], item[1].updated_at), reverse=True)
+        return [task for _, task in scored[:limit]]
 
     def chat_state_path(self, chat_id: int) -> Path:
         return self.state_dir / "chats" / f"{chat_id}.json"

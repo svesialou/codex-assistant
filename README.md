@@ -3,16 +3,17 @@
 Local Telegram long-poll bot for starting Codex tasks in local projects.
 Project directories are configured through environment files during install.
 
-The bot itself is Python stdlib-only. Docker is the recommended runtime because
-`restart: unless-stopped` keeps the bot running after crashes and daemon restarts.
+The bot itself is Python stdlib-only. The default runtime is a host daemon:
+`systemd --user` when available, otherwise a small background supervisor script.
+Codex tasks therefore run through the host `codex` CLI, not inside Docker.
 
 ## What Is Stored Where
 
-- Repository: source code, tests, Docker config, install scripts.
+- Repository: source code, tests, optional Docker config, install scripts.
 - `~/.codex/secrets/telegram.env`: Telegram and optional Slack secrets.
 - `~/.codex/telegram-bot`: task state, attachments, logs, chat state.
 - `~/.codex/project-index`: generated project index and per-project context.
-- `~/.codex/auth.json` and `~/.codex/config.toml`: Codex CLI auth/config reused by the container.
+- `~/.codex/auth.json` and `~/.codex/config.toml`: Codex CLI auth/config reused by host Codex tasks.
 
 Do not commit `~/.codex`, `.env`, logs, sqlite files, or task state.
 
@@ -20,9 +21,9 @@ Do not commit `~/.codex`, `.env`, logs, sqlite files, or task state.
 
 Prerequisites:
 
-- Docker with Compose v2
 - Git
 - A configured Codex CLI account in `~/.codex` on the host
+- Python 3.12+
 - Telegram bot token and allowed chat id
 
 Clone anywhere and install:
@@ -37,7 +38,6 @@ Configure secrets and project roots:
 
 ```sh
 nano ~/.codex/secrets/telegram.env
-nano .env
 ```
 
 Required values:
@@ -59,7 +59,7 @@ positive id as the allowed user id by default. For group chats, set
 `CODEX_TELEGRAM_ALLOWED_USER_IDS` explicitly; otherwise the bot refuses to start
 instead of accepting commands from everyone in the group.
 
-Start through Docker:
+Start the host daemon:
 
 ```sh
 ~/.codex/scripts/codex-telegram-bot-control.sh restart
@@ -67,11 +67,69 @@ Start through Docker:
 ~/.codex/scripts/codex-telegram-bot-control.sh log
 ```
 
-The control script uses Docker automatically when the cloned repository and
-`docker-compose.yml` are available. Set `CODEX_TELEGRAM_RUN_MODE=process` only
-when you explicitly want the old background-process mode.
+`restart` prefers `systemd --user` and automatically installs
+`codex-telegram-bot.service` with `Restart=always`. If user systemd is not
+available, the control script starts `codex-telegram-bot-supervisor.sh` in the
+background; it restarts the bot after crashes. Use
+`~/.codex/scripts/codex-telegram-bot-control.sh enable` to enable user autostart
+on systems with `systemd --user`.
 
-## Docker Runtime
+On systems with `systemd --user`, `enable` also installs and starts
+`codex-telegram-bot-watchdog.timer`. The timer runs once per minute and starts
+the bot if the service is inactive or failed. This covers clean stops that are
+not treated as failures by systemd. If `restart` is invoked from a Codex task
+owned by the bot service, the control script schedules a deferred restart in a
+separate transient user unit so the current Codex process can finish before the
+bot service is restarted.
+
+`enable` also installs `codex-network-watchdog.timer`. It checks real internet
+connectivity once per minute with HTTP probes before trusting the local
+NetworkManager state. If the machine reports a wired/VPN connection but the
+internet is unreachable, it reconnects matching active NetworkManager
+connections and then lets the bot watchdog start or recover the bot. Reconnects
+are throttled by a five minute cooldown.
+
+Useful host daemon commands:
+
+```sh
+~/.codex/scripts/codex-telegram-bot-control.sh enable
+~/.codex/scripts/codex-telegram-bot-control.sh watchdog-status
+~/.codex/scripts/codex-telegram-bot-control.sh watchdog-check
+~/.codex/scripts/codex-telegram-bot-control.sh network-watchdog-status
+~/.codex/scripts/codex-telegram-bot-control.sh network-status
+~/.codex/scripts/codex-telegram-bot-control.sh disable
+```
+
+`disable` stops and disables the bot service, bot watchdog timer, and network
+watchdog timer.
+
+Network watchdog configuration:
+
+```sh
+CODEX_NETWORK_RECONNECT_ENABLED=0         # check only, never reconnect
+CODEX_NETWORK_RECONNECT_COOLDOWN_SECONDS=300
+CODEX_NETWORK_CHECK_URLS="https://api.telegram.org http://connectivity-check.ubuntu.com/"
+CODEX_NETWORK_RECONNECT_TYPES="vpn:tun:802-3-ethernet:802-11-wireless"
+CODEX_NETWORK_RECONNECT_CONNECTIONS="netplan-enp3s0"
+```
+
+Runtime modes:
+
+```sh
+CODEX_TELEGRAM_RUN_MODE=auto       # default: systemd if available, else supervisor
+CODEX_TELEGRAM_RUN_MODE=systemd    # require systemd --user
+CODEX_TELEGRAM_RUN_MODE=supervisor # force the host supervisor
+CODEX_TELEGRAM_RUN_MODE=process    # one background process without restart loop
+CODEX_TELEGRAM_RUN_MODE=docker     # optional Docker runtime
+```
+
+## Optional Docker Runtime
+
+Docker is still available as an explicit opt-in:
+
+```sh
+CODEX_TELEGRAM_RUN_MODE=docker ~/.codex/scripts/codex-telegram-bot-control.sh restart
+```
 
 Compose mounts Codex config and one host workspace root into the container:
 
@@ -99,7 +157,7 @@ CODEX_TELEGRAM_PROJECT_DIRS=/data/work/company:/data/work/personal
 ```
 
 For roots that do not share a practical parent, use a broader common parent
-such as `/home/your-user`, or run in process mode on the host.
+such as `/home/your-user`, or use the default host daemon runtime.
 
 On container startup, Compose rebuilds the project index with container paths
 before starting the long-poll bot. Because the workspace root is mounted to the
@@ -128,6 +186,14 @@ Run the bot without Docker:
 
 ```sh
 PYTHONPATH=. python3 -m codex_telegram_bot
+```
+
+The installed host runner auto-syncs runtime code from the source repository
+recorded in `~/.codex/codex-assistant.repo` before starting the bot. Disable it
+only for troubleshooting:
+
+```sh
+CODEX_TELEGRAM_AUTO_SYNC=0 ~/.codex/scripts/codex-telegram-bot-control.sh restart
 ```
 
 Rebuild the project index:
@@ -159,6 +225,30 @@ CODEX_TELEGRAM_TRANSCRIBE_TIMEOUT_SECONDS=300
 are downloaded and passed to the command. The command must print the transcript
 to stdout.
 
+Optional orchestration/model routing settings:
+
+```sh
+CODEX_TELEGRAM_ORCHESTRATOR=1
+CODEX_ORCHESTRATOR_MODEL_ROUTING=auto
+CODEX_ORCHESTRATOR_DEFAULT_TIER=cheap
+CODEX_ORCHESTRATOR_MAX_AUTO_TIER=strong
+CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX=1
+CODEX_ORCHESTRATOR_DEBATE=0
+CODEX_ORCHESTRATOR_MAX_REVIEW_ROUNDS=2
+CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX=1
+CODEX_CLAUDE_CMD='your-claude-wrapper'
+CLAUDE_CHEAP_MODEL=
+CLAUDE_STANDARD_MODEL=
+CLAUDE_STRONG_MODEL=
+CODEX_CHEAP_MODEL=
+CODEX_STANDARD_MODEL=
+CODEX_STRONG_MODEL=
+CODEX_MAX_MODEL=
+```
+
+Claude transport is optional. If it is not configured and fallback is enabled,
+orchestrated tasks run through Codex-only flow with a Telegram warning.
+
 Interrupted task recovery:
 
 ```sh
@@ -174,6 +264,19 @@ work.
 Optional Slack forwarding:
 
 ```sh
+CODEX_SLACK_DESKTOP_NOTIFICATIONS=1
+CODEX_SLACK_TELEGRAM_CHAT_IDS=123456789
+```
+
+Desktop notification forwarding is enabled by default and does not use Slack
+API. The bot listens to local `org.freedesktop.Notifications` events through
+`dbus-monitor` and forwards Slack notifications that the desktop session already
+shows in the tray. Only the sender/title and message text exposed by the local
+notification are available.
+
+Optional Slack API polling:
+
+```sh
 CODEX_SLACK_TOKEN=xoxp-or-xoxb-token
 CODEX_SLACK_WATCH_DMS=1
 CODEX_SLACK_PINNED_CHANNEL_IDS=C0123456789,G0123456789
@@ -185,6 +288,32 @@ CODEX_SLACK_HISTORY_LIMIT=20
 Slack channel IDs are configured explicitly. Use a Slack token with read access
 for the conversation types you need.
 
+Optional Linear MCP integration for Codex tasks:
+
+```sh
+codex mcp add linear --url https://mcp.linear.app/mcp
+codex mcp login linear
+```
+
+Check the local MCP configuration:
+
+```sh
+~/.codex/scripts/codex-linear.sh status
+```
+
+After OAuth is configured, start a new Codex session and use the Linear MCP
+tools exposed by Codex. Useful Linear tool names include:
+
+- `get_issue`
+- `list_teams`
+- `list_issue_statuses`
+- `save_issue`
+
+`codex-linear.sh` is kept only as a compatibility helper for MCP setup/status.
+It no longer calls Linear GraphQL directly and does not use `CODEX_LINEAR_*`
+OAuth settings. Do not paste OAuth callback URLs, authorization codes, or token
+contents into chat or logs.
+
 ## Telegram Commands
 
 ```text
@@ -195,10 +324,15 @@ for the conversation types you need.
 /context <project>
 /new
 /agent on|off
+/orchestrator_on
+/orchestrator_off
+/orchestrator_status
+/settings orchestrator on|off|status
+/debug on|off
 /ask <text>
 /task <project> <text>
 /task <text>
-/run <project> <text>
+/run [tier=auto|cheap|standard|strong|max] <project> <text>
 /run <text>
 /answer <task_id> <text>
 /confirm <task_id>
@@ -207,18 +341,19 @@ for the conversation types you need.
 /status [task_id]
 /processes
 /logs <task_id>
+/memory status|search|forget|summarize|export
 ```
 
 ## Execution Flow
 
-1. Select `Root` or a project with buttons.
-2. `New task` or `/task` creates a task in the selected context.
+1. Send a task as plain text, or use `Run custom` / `/run` for manual prompts.
+2. The bot resolves project context from aliases, recent context, and task text.
 3. Consecutive text messages are joined after a short quiet window.
-4. The bot runs `codex exec` with read-only sandbox for planning.
-5. The plan message has buttons to attach files, answer clarifications, execute, or cancel.
-6. `/answer` appends clarification and reruns read-only planning.
-7. `/confirm` starts real `codex exec` with `danger-full-access`.
-8. The final Codex answer is sent to Telegram, and logs stay on disk.
-9. Completed tasks with a Codex session can be continued with `/continue`.
+4. Planned tasks still use read-only Codex planning before `/confirm`.
+5. Direct tasks use ModelRouter when orchestrator mode is on.
+6. Cheap/simple tasks stay Codex-only; larger tasks may use Claude Architect and Reviewer.
+7. The final Codex answer is sent to Telegram, and logs/trace stay on disk.
+8. Completed tasks with a Codex session can be continued with `/continue`.
 
-Direct execution is available through `/run` or the `Run task` button.
+The main menu is task-first: `Tasks`, `Run custom`, `Settings`, and `Help`.
+Advanced project, memory, trace, and model controls live under settings or task cards.

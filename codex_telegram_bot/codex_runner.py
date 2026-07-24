@@ -25,6 +25,39 @@ def read_context(index_dir: Path, project_slug: str, max_chars: int = 12000) -> 
     return text[:max_chars].rstrip() + "\n..."
 
 
+def task_context_slugs(task: TaskRecord, primary_slug: str) -> list[str]:
+    slugs: list[str] = []
+    for slug in [primary_slug, *task.context_project_slugs]:
+        if slug and slug not in slugs:
+            slugs.append(slug)
+    return slugs or [primary_slug]
+
+
+def read_task_context(
+    index_dir: Path,
+    task: TaskRecord,
+    primary_project: ProjectInfo,
+    max_chars: int = 20000,
+) -> str:
+    slugs = task_context_slugs(task, primary_project.slug)
+    if len(slugs) == 1:
+        return read_context(index_dir, slugs[0])
+
+    per_project_limit = max(2000, max_chars // len(slugs))
+    sections = [
+        "# Active Development Context",
+        "",
+        f"- Primary project: `{primary_project.slug}`",
+        f"- Active projects: {', '.join(slugs)}",
+    ]
+    for slug in slugs:
+        context = read_context(index_dir, slug, max_chars=per_project_limit)
+        if not context:
+            continue
+        sections.extend(["", f"## Project Context: {slug}", "", context.rstrip()])
+    return "\n".join(sections).rstrip() + "\n"
+
+
 def attachment_context(task: TaskRecord) -> str:
     if not task.attachments:
         return "- none"
@@ -154,6 +187,13 @@ def execution_prompt(task: TaskRecord, context: str) -> str:
         intro = "The user confirmed this Telegram task. Execute it in the selected project."
         plan = task.plan_text.strip() or "No prior plan was recorded."
     attachments = attachment_context(task)
+    prepared_prompt = task.prepared_codex_prompt.strip()
+    codex_task = prepared_prompt or task.prompt
+    prepared_block = (
+        f"\nPrepared prompt from orchestrator:\n{prepared_prompt}\n"
+        if prepared_prompt
+        else ""
+    )
     return f"""{intro}
 
 Follow global and project AGENTS instructions. Before editing, inspect relevant repo files and local instructions.
@@ -175,6 +215,9 @@ Project agent context:
 
 Original task:
 {task.prompt}
+{prepared_block}
+Task to execute:
+{codex_task}
 
 Clarifications:
 {clarifications}
@@ -200,7 +243,7 @@ def interrupted_execution_prompt(
     plan = task.plan_text.strip() or "No prior plan was recorded."
     log_tail = previous_log_tail.strip() or "-"
     final_text = previous_final.strip() or "-"
-    return f"""The previous Codex process for this Telegram task was interrupted by a bot or container restart.
+    return f"""The previous Codex process for this Telegram task was interrupted by a bot, daemon, or container restart.
 
 Continue from the current workspace state. First inspect git status, relevant files, existing logs, and the existing final answer if useful.
 Do not assume that no work was done before the restart. Do not repeat already completed changes.
@@ -337,7 +380,12 @@ class CodexRunner:
         env["CODEX_TELEGRAM_SUPPRESS_STOP_HOOK"] = "1"
         return env
 
-    def _base_command(self, project_path: str, output_path: Path) -> list[str]:
+    def _base_command(
+        self,
+        project_path: str,
+        output_path: Path,
+        model: str | None = None,
+    ) -> list[str]:
         command = [
             self.config.codex_bin,
             "exec",
@@ -349,11 +397,17 @@ class CodexRunner:
             "-o",
             str(output_path),
         ]
-        if self.config.model:
-            command.extend(["-m", self.config.model])
+        selected_model = model or self.config.model
+        if selected_model:
+            command.extend(["-m", selected_model])
         return command
 
-    def _resume_command(self, session_id: str, output_path: Path) -> list[str]:
+    def _resume_command(
+        self,
+        session_id: str,
+        output_path: Path,
+        model: str | None = None,
+    ) -> list[str]:
         command = [
             self.config.codex_bin,
             "exec",
@@ -366,8 +420,9 @@ class CodexRunner:
             "-o",
             str(output_path),
         ]
-        if self.config.model:
-            command.extend(["-m", self.config.model])
+        selected_model = model or self.config.model
+        if selected_model:
+            command.extend(["-m", selected_model])
         command.extend([session_id, "-"])
         return command
 
@@ -386,7 +441,12 @@ class CodexRunner:
         task.pid_start_time = ""
         self.store.save_task(task)
 
-    def run_planning(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
+    def run_planning(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        model: str | None = None,
+    ) -> TaskRecord:
         task.phase = "planning"
         task.returncode = None
         task.error = ""
@@ -397,10 +457,10 @@ class CodexRunner:
         task.plan_log_path = str(log_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(planning_prompt(task, context), encoding="utf-8")
 
-        command = self._base_command(task.project_path, plan_path)
+        command = self._base_command(task.project_path, plan_path, model=model)
         command.extend(["-s", "read-only", "-"])
 
         with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
@@ -433,7 +493,12 @@ class CodexRunner:
         self._mark_process_finished(task)
         return task
 
-    def run_execution(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
+    def run_execution(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        model: str | None = None,
+    ) -> TaskRecord:
         task.phase = "running"
         task.returncode = None
         task.error = ""
@@ -446,10 +511,10 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
-        command = self._base_command(task.project_path, final_path)
+        command = self._base_command(task.project_path, final_path, model=model)
         command.extend(["-s", "danger-full-access", "-"])
 
         with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
@@ -485,6 +550,7 @@ class CodexRunner:
         self,
         task: TaskRecord,
         project: ProjectInfo,
+        model: str | None = None,
     ) -> TaskRecord:
         task.phase = "running"
         task.returncode = None
@@ -503,7 +569,7 @@ class CodexRunner:
             task.codex_session_id = extract_session_id(log_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(
             interrupted_execution_prompt(
                 task,
@@ -516,9 +582,9 @@ class CodexRunner:
 
         resume_session_id = task.codex_session_id
         if resume_session_id:
-            command = self._resume_command(resume_session_id, final_path)
+            command = self._resume_command(resume_session_id, final_path, model=model)
         else:
-            command = self._base_command(task.project_path, final_path)
+            command = self._base_command(task.project_path, final_path, model=model)
             command.extend(["-s", "danger-full-access", "-"])
 
         with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
@@ -550,7 +616,12 @@ class CodexRunner:
         self._mark_process_finished(task)
         return task
 
-    def run_followup_execution(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
+    def run_followup_execution(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        model: str | None = None,
+    ) -> TaskRecord:
         if not task.codex_session_id:
             task.phase = "failed"
             task.error = "Parent Codex session id is missing."
@@ -569,7 +640,7 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         parent_task = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
         prompt_path.write_text(
             continuation_prompt(task, context, parent_task),
@@ -577,7 +648,7 @@ class CodexRunner:
         )
 
         resume_session_id = task.codex_session_id
-        command = self._resume_command(resume_session_id, final_path)
+        command = self._resume_command(resume_session_id, final_path, model=model)
 
         with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
             process = subprocess.Popen(
@@ -608,6 +679,64 @@ class CodexRunner:
         self._mark_process_finished(task)
         return task
 
+    def run_revision_execution(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        round_number: int,
+        model: str | None = None,
+    ) -> TaskRecord:
+        task.phase = "running"
+        task.returncode = None
+        task.error = ""
+        task_dir = self.store.task_dir(task.id)
+        final_path = task_dir / f"final-revision-{round_number}.md"
+        log_path = task_dir / "run.log"
+        prompt_path = task_dir / f"revision-{round_number}-prompt.md"
+        task.final_path = str(final_path)
+        task.run_log_path = str(log_path)
+        task.prompt_path = str(prompt_path)
+        self.store.save_task(task)
+
+        context = read_task_context(self.config.index_dir, task, project)
+        prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
+
+        resume_session_id = task.codex_session_id
+        if resume_session_id:
+            command = self._resume_command(resume_session_id, final_path, model=model)
+        else:
+            command = self._base_command(task.project_path, final_path, model=model)
+            command.extend(["-s", "danger-full-access", "-"])
+
+        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=task.project_path,
+                start_new_session=True,
+                env=self._command_env(),
+            )
+            self._mark_process_started(task, process)
+            try:
+                returncode = process.wait(timeout=self.config.run_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                returncode = wait_after_stop(process)
+                task.phase = "failed"
+                task.error = "Revision execution timed out."
+            else:
+                task.returncode = returncode
+                if returncode == 0:
+                    task.phase = "completed"
+                else:
+                    task.phase = "failed"
+                    task.error = f"Revision execution failed with exit code {returncode}."
+
+        task.codex_session_id = extract_session_id(log_path) or resume_session_id
+        self._mark_process_finished(task)
+        return task
+
     def run_agent_chat(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
         task.phase = "agent_running"
         task.returncode = None
@@ -621,7 +750,7 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_context(self.config.index_dir, project.slug)
+        context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(agent_chat_prompt(task, context), encoding="utf-8")
 
         command = self._base_command(task.project_path, final_path)

@@ -34,10 +34,10 @@ if [ -d "${TOOL_DIR}/codex_telegram_bot" ]; then
 elif [ -d "${REPO_DIR}/codex_telegram_bot" ]; then
   PYTHONPATH_ROOT="${REPO_DIR}"
 else
-  echo "codex telegram bot sources not found" >&2
+  echo "codex assistant sources not found" >&2
   echo "Run scripts/install.sh from the codex-assistant repository." >&2
   exit 1
 fi
 
 export PYTHONPATH="${PYTHONPATH_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
-exec python3 -m codex_telegram_bot "$@"
+exec python3 -m codex_telegram_bot.linear "$@"
