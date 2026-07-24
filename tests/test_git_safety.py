@@ -7,6 +7,7 @@ from pathlib import Path
 
 from codex_telegram_bot.services.git_safety import (
     capture_git_snapshot,
+    force_push_current_branch,
     read_git_snapshot,
     snapshot_summary,
     write_git_snapshot,
@@ -56,6 +57,64 @@ class GitSafetyTest(unittest.TestCase):
         self.assertTrue(artifact_exists)
         self.assertIsNotNone(loaded)
         self.assertIn("dirty state", snapshot_summary(snapshot))
+
+    def test_force_push_blocks_protected_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            git(repo, "init")
+            git(repo, "config", "user.email", "bot-test@example.test")
+            git(repo, "config", "user.name", "Bot Test")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "base")
+            git(repo, "checkout", "-b", "main")
+
+            result = force_push_current_branch(repo)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.branch, "main")
+        self.assertIn("protected branch", result.error)
+
+    def test_force_push_current_branch_uses_force_with_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            remote = root / "remote.git"
+            repo = root / "repo"
+            git(root, "init", "--bare", str(remote))
+            git(root, "clone", str(remote), str(repo))
+            git(repo, "config", "user.email", "bot-test@example.test")
+            git(repo, "config", "user.name", "Bot Test")
+            git(repo, "checkout", "-b", "feature/force-push")
+            (repo / "README.md").write_text("base\n", encoding="utf-8")
+            git(repo, "add", "README.md")
+            git(repo, "commit", "-m", "base")
+            git(repo, "push", "-u", "origin", "HEAD")
+            (repo / "README.md").write_text("rewritten\n", encoding="utf-8")
+            git(repo, "commit", "--amend", "-am", "rewritten")
+
+            result = force_push_current_branch(repo)
+            local_head = subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+            remote_head = subprocess.run(
+                ["git", "rev-parse", "refs/heads/feature/force-push"],
+                cwd=remote,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            ).stdout.strip()
+
+        self.assertTrue(result.ok, result.error)
+        self.assertEqual(result.branch, "feature/force-push")
+        self.assertEqual(result.upstream, "origin/feature/force-push")
+        self.assertIn("--force-with-lease", result.command)
+        self.assertEqual(remote_head, local_head)
 
 
 if __name__ == "__main__":

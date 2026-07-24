@@ -225,6 +225,30 @@ CODEX_TELEGRAM_TRANSCRIBE_TIMEOUT_SECONDS=300
 are downloaded and passed to the command. The command must print the transcript
 to stdout.
 
+Optional orchestration/model routing settings:
+
+```sh
+CODEX_TELEGRAM_ORCHESTRATOR=1
+CODEX_ORCHESTRATOR_MODEL_ROUTING=auto
+CODEX_ORCHESTRATOR_DEFAULT_TIER=cheap
+CODEX_ORCHESTRATOR_MAX_AUTO_TIER=strong
+CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX=1
+CODEX_ORCHESTRATOR_DEBATE=0
+CODEX_ORCHESTRATOR_MAX_REVIEW_ROUNDS=2
+CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX=1
+CODEX_CLAUDE_CMD='your-claude-wrapper'
+CLAUDE_CHEAP_MODEL=
+CLAUDE_STANDARD_MODEL=
+CLAUDE_STRONG_MODEL=
+CODEX_CHEAP_MODEL=
+CODEX_STANDARD_MODEL=
+CODEX_STRONG_MODEL=
+CODEX_MAX_MODEL=
+```
+
+Claude transport is optional. If it is not configured and fallback is enabled,
+orchestrated tasks run through Codex-only flow with a Telegram warning.
+
 Interrupted task recovery:
 
 ```sh
@@ -264,6 +288,32 @@ CODEX_SLACK_HISTORY_LIMIT=20
 Slack channel IDs are configured explicitly. Use a Slack token with read access
 for the conversation types you need.
 
+Optional Linear MCP integration for Codex tasks:
+
+```sh
+codex mcp add linear --url https://mcp.linear.app/mcp
+codex mcp login linear
+```
+
+Check the local MCP configuration:
+
+```sh
+~/.codex/scripts/codex-linear.sh status
+```
+
+After OAuth is configured, start a new Codex session and use the Linear MCP
+tools exposed by Codex. Useful Linear tool names include:
+
+- `get_issue`
+- `list_teams`
+- `list_issue_statuses`
+- `save_issue`
+
+`codex-linear.sh` is kept only as a compatibility helper for MCP setup/status.
+It no longer calls Linear GraphQL directly and does not use `CODEX_LINEAR_*`
+OAuth settings. Do not paste OAuth callback URLs, authorization codes, or token
+contents into chat or logs.
+
 ## Telegram Commands
 
 ```text
@@ -274,10 +324,15 @@ for the conversation types you need.
 /context <project>
 /new
 /agent on|off
+/orchestrator_on
+/orchestrator_off
+/orchestrator_status
+/settings orchestrator on|off|status
+/debug on|off
 /ask <text>
 /task <project> <text>
 /task <text>
-/run <project> <text>
+/run [tier=auto|cheap|standard|strong|max] <project> <text>
 /run <text>
 /answer <task_id> <text>
 /confirm <task_id>
@@ -286,18 +341,19 @@ for the conversation types you need.
 /status [task_id]
 /processes
 /logs <task_id>
+/memory status|search|forget|summarize|export
 ```
 
 ## Execution Flow
 
-1. Select `Root` or a project with buttons.
-2. `New task` or `/task` creates a task in the selected context.
+1. Send a task as plain text, or use `Run custom` / `/run` for manual prompts.
+2. The bot resolves project context from aliases, recent context, and task text.
 3. Consecutive text messages are joined after a short quiet window.
-4. The bot runs `codex exec` with read-only sandbox for planning.
-5. The plan message has buttons to attach files, answer clarifications, execute, or cancel.
-6. `/answer` appends clarification and reruns read-only planning.
-7. `/confirm` starts real `codex exec` with `danger-full-access`.
-8. The final Codex answer is sent to Telegram, and logs stay on disk.
-9. Completed tasks with a Codex session can be continued with `/continue`.
+4. Planned tasks still use read-only Codex planning before `/confirm`.
+5. Direct tasks use ModelRouter when orchestrator mode is on.
+6. Cheap/simple tasks stay Codex-only; larger tasks may use Claude Architect and Reviewer.
+7. The final Codex answer is sent to Telegram, and logs/trace stay on disk.
+8. Completed tasks with a Codex session can be continued with `/continue`.
 
-Direct execution is available through `/run` or the `Run task` button.
+The main menu is task-first: `Tasks`, `Run custom`, `Settings`, and `Help`.
+Advanced project, memory, trace, and model controls live under settings or task cards.

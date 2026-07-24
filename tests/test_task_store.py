@@ -129,6 +129,33 @@ class TaskStoreTest(unittest.TestCase):
         self.assertIsNotNone(updated)
         self.assertEqual(loaded.attachments[0]["file_name"], "report.txt")
 
+    def test_search_tasks_matches_prompt_summary_and_project(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = TaskStore(Path(tmp))
+            first = store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="billing-api",
+                project_name="billing-api",
+                project_path="/tmp/billing",
+                prompt="Fix auth redirect bug",
+            )
+            first.summary = "Updated token refresh handling"
+            store.save_task(first)
+            second = store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="bot",
+                project_name="bot",
+                project_path="/tmp/bot",
+                prompt="Add orchestrator",
+            )
+            store.save_task(second)
+
+            matches = store.search_tasks("token auth", chat_id=10)
+
+        self.assertEqual([item.id for item in matches], [first.id])
+
 
 if __name__ == "__main__":
     unittest.main()

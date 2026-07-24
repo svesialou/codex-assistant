@@ -13,6 +13,7 @@ dependencies = []
 [project.scripts]
 codex-telegram-bot = "codex_telegram_bot.bot:main"
 codex-project-index = "codex_telegram_bot.project_index:main"
+codex-linear = "codex_telegram_bot.linear:main"
 
 [tool.setuptools]
 packages = ["codex_telegram_bot", "codex_telegram_bot.services"]

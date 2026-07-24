@@ -9,6 +9,8 @@ from ..task_store import now_iso
 
 
 GIT_TIMEOUT_SECONDS = 10
+GIT_PUSH_TIMEOUT_SECONDS = 120
+PROTECTED_FORCE_PUSH_BRANCHES = {"main", "master"}
 
 
 @dataclass(frozen=True)
@@ -28,14 +30,28 @@ class GitSnapshot:
         return self.dirty_files > 0
 
 
-def run_git(project_path: str | Path, args: list[str]) -> subprocess.CompletedProcess[str]:
+@dataclass(frozen=True)
+class GitForcePushResult:
+    ok: bool
+    branch: str = ""
+    upstream: str = ""
+    command: str = ""
+    output: str = ""
+    error: str = ""
+
+
+def run_git(
+    project_path: str | Path,
+    args: list[str],
+    timeout: int = GIT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", *args],
         cwd=project_path,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        timeout=GIT_TIMEOUT_SECONDS,
+        timeout=timeout,
         check=False,
     )
 
@@ -118,3 +134,74 @@ def read_git_snapshot(task_dir: Path, label: str) -> GitSnapshot | None:
         return GitSnapshot(**data)
     except (OSError, TypeError, json.JSONDecodeError):
         return None
+
+
+def force_push_current_branch(project_path: str | Path) -> GitForcePushResult:
+    path = Path(project_path)
+    if not is_git_repo(path):
+        return GitForcePushResult(ok=False, error="Git repo not detected.")
+
+    branch, branch_error = git_output(path, ["branch", "--show-current"])
+    if branch_error:
+        return GitForcePushResult(ok=False, error=branch_error)
+    if not branch:
+        return GitForcePushResult(ok=False, error="Current branch is detached or unknown.")
+    if branch in PROTECTED_FORCE_PUSH_BRANCHES:
+        return GitForcePushResult(
+            ok=False,
+            branch=branch,
+            error=f"Force push is blocked for protected branch: {branch}.",
+        )
+
+    upstream, upstream_error = git_output(
+        path,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+    )
+    if upstream_error or not upstream:
+        return GitForcePushResult(
+            ok=False,
+            branch=branch,
+            error=upstream_error or "Current branch has no upstream configured.",
+        )
+
+    remote, _, remote_branch = upstream.partition("/")
+    if not remote or not remote_branch:
+        return GitForcePushResult(
+            ok=False,
+            branch=branch,
+            upstream=upstream,
+            error=f"Unsupported upstream format: {upstream}.",
+        )
+
+    args = ["push", "--force-with-lease", remote, f"HEAD:{remote_branch}"]
+    command = "git " + " ".join(args)
+    try:
+        result = run_git(path, args, timeout=GIT_PUSH_TIMEOUT_SECONDS)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return GitForcePushResult(
+            ok=False,
+            branch=branch,
+            upstream=upstream,
+            command=command,
+            error=str(exc),
+        )
+
+    output = "\n".join(
+        item for item in [result.stdout.strip(), result.stderr.strip()] if item
+    )
+    if result.returncode != 0:
+        return GitForcePushResult(
+            ok=False,
+            branch=branch,
+            upstream=upstream,
+            command=command,
+            output=output,
+            error=f"git push exited with code {result.returncode}.",
+        )
+    return GitForcePushResult(
+        ok=True,
+        branch=branch,
+        upstream=upstream,
+        command=command,
+        output=output,
+    )

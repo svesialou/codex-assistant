@@ -46,6 +46,11 @@ REMEMBER_PATTERNS = [
     ),
 ]
 QUESTION_RE = re.compile(r"^\s*(что|как|почему|зачем|где|когда|можешь|можно|сколько)\b", re.IGNORECASE)
+CONTINUE_SEARCH_RE = re.compile(
+    r"^\s*(?P<verb>продолжи|continue|возобнови|доделай|найди|покажи)\s+"
+    r"(?P<query>.+)$",
+    re.IGNORECASE,
+)
 
 
 def normalize_text(text: str) -> str:
@@ -121,6 +126,13 @@ class IntentRouter:
                 0.92,
                 task_id=context.last_task_with_session_id or context.last_completed_task_id or None,
             )
+        continue_match = CONTINUE_SEARCH_RE.match(stripped)
+        if continue_match:
+            verb = continue_match.group("verb").lower()
+            query = continue_match.group("query").strip()
+            if verb in {"найди", "покажи"}:
+                return IntentResult("search_tasks", 0.78, task_text=query)
+            return IntentResult("continue_task", 0.78, task_text=query)
         if normalized in {"запускай", "делай", "выполняй", "выполнить", "запусти", "go"}:
             return IntentResult(
                 "confirm_execution",

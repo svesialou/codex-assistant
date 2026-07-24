@@ -20,6 +20,7 @@ from codex_telegram_bot.bot import (
 )
 from codex_telegram_bot.config import Config
 from codex_telegram_bot.project_index import ProjectInfo
+from codex_telegram_bot.services.git_safety import GitForcePushResult
 from codex_telegram_bot.task_store import TaskRecord
 
 
@@ -104,12 +105,10 @@ class BotUiTest(unittest.TestCase):
     def test_command_parts_strips_bot_name(self) -> None:
         self.assertEqual(command_parts("/task@my_bot demo"), ("/task", "demo"))
 
-    def test_main_menu_has_agent_toggle(self) -> None:
+    def test_main_menu_is_task_first(self) -> None:
         keyboard = main_menu_keyboard(agent_mode=True)
         labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
-        self.assertIn("Agent: on", labels)
-        self.assertIn("📊 Статус", labels)
-        self.assertIn("▶️ Run task", labels)
+        self.assertEqual(labels, ["📋 Задачи", "▶️ Run custom", "⚙️ Настройки", "❓ Помощь"])
 
     def test_bot_commands_include_menu_first(self) -> None:
         self.assertEqual(BOT_COMMANDS[0]["command"], "menu")
@@ -154,6 +153,7 @@ class BotUiTest(unittest.TestCase):
         self.assertIn("contattach:task-1", callbacks)
         self.assertIn("task:brain:task-1", callbacks)
         self.assertIn("task:remember:task-1", callbacks)
+        self.assertIn("task:force_push:task-1", callbacks)
 
     def test_running_task_keyboard_has_clarify_and_stop_actions(self) -> None:
         keyboard = running_task_keyboard("task-1")
@@ -331,6 +331,24 @@ class BotUiTest(unittest.TestCase):
                 "No active Codex processes across projects.",
             ],
         )
+
+    def test_orchestrator_commands_toggle_chat_setting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            sent: list[str] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text) or 1
+
+            bot.dispatch_command(10, 20, "/orchestrator_off", "")
+            off_state = bot.store.load_chat_state(10)
+            bot.dispatch_command(10, 20, "/orchestrator_on", "")
+            on_state = bot.store.load_chat_state(10)
+            bot.dispatch_command(10, 20, "/settings", "orchestrator status")
+
+        self.assertFalse(off_state.orchestrator_mode)
+        self.assertTrue(on_state.orchestrator_mode)
+        self.assertIn("Orchestrator: OFF", sent[0])
+        self.assertIn("Orchestrator: ON", sent[-1])
 
     def test_recover_interrupted_tasks_queues_stale_running_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,7 +660,22 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(spawned[0][0].__name__, "execute_task")
         self.assertEqual(spawned[0][1], (tasks[0].id, None))
         self.assertIn("Статус Codex", sent[-1])
-        self.assertIn("Direct execution task", sent[-1])
+        self.assertIn("Orchestrator mode включён", sent[-1])
+
+    def test_run_command_accepts_manual_tier_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            bot.send = lambda chat_id, text, reply_markup=None: None
+            bot.spawn = lambda target, *args: None
+
+            bot.dispatch_command(10, 20, "/run", "tier=cheap demo fix README typo")
+            bot.flush_prompt_draft(10)
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+
+        self.assertEqual(tasks[0].model_routing["manual_tier"], "cheap")
 
     def test_continue_command_collects_parts_and_resumes_parent_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -977,6 +1010,38 @@ class BotUiTest(unittest.TestCase):
 
         self.assertIn("Мозги команды", bot.api.sent[-1][1])
         self.assertIn("PM: Принял задачу", bot.api.sent[-1][1])
+
+    def test_force_push_callback_runs_completed_task_action(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.api = FakeTelegramAPI()
+            task = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "do work")
+            task.phase = "completed"
+            bot.store.save_task(task)
+
+            original_force_push = bot_module.force_push_current_branch
+            bot_module.force_push_current_branch = lambda _path: GitForcePushResult(
+                ok=True,
+                branch="feature/demo",
+                upstream="origin/feature/demo",
+                command="git push --force-with-lease origin HEAD:feature/demo",
+                output="forced update",
+            )
+            try:
+                bot.handle_callback(
+                    {
+                        "id": "callback-1",
+                        "data": f"task:force_push:{task.id}",
+                        "message": {"message_id": 42, "chat": {"id": 10}},
+                        "from": {"id": 20},
+                    }
+                )
+            finally:
+                bot_module.force_push_current_branch = original_force_push
+
+        self.assertIn("Force push completed", bot.api.sent[-1][1])
+        self.assertIn("feature/demo", bot.api.sent[-1][1])
 
     def test_plain_text_confirm_executes_last_planned_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -89,6 +89,13 @@ def parse_bool(value: str | None, default: bool = False) -> bool:
     raise ValueError(f"Invalid boolean value: {value}")
 
 
+def parse_optional_int(value: str | None) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    parsed = int(value)
+    return parsed if parsed > 0 else None
+
+
 def parse_path_list(value: str | None, default: Iterable[Path]) -> list[Path]:
     if not value:
         return [path.expanduser() for path in default]
@@ -99,6 +106,74 @@ def parse_path_list(value: str | None, default: Iterable[Path]) -> list[Path]:
         for item in value.split(sep)
         if item.strip()
     ]
+
+
+def normalize_tier(value: str | None, default: str = "auto") -> str:
+    tier = (value or default).strip().lower()
+    if tier not in {"auto", "cheap", "standard", "strong", "max"}:
+        raise ValueError(f"Invalid model tier: {value}")
+    return tier
+
+
+@dataclass(frozen=True)
+class ClaudeModelConfig:
+    cheap: str | None = None
+    standard: str | None = None
+    strong: str | None = None
+
+    def for_tier(self, tier: str) -> str | None:
+        if tier == "cheap":
+            return self.cheap
+        if tier == "standard":
+            return self.standard or self.cheap
+        if tier in {"strong", "max"}:
+            return self.strong or self.standard or self.cheap
+        return None
+
+
+@dataclass(frozen=True)
+class CodexModelConfig:
+    cheap: str | None = None
+    standard: str | None = None
+    strong: str | None = None
+    max: str | None = None
+
+    def for_tier(self, tier: str) -> str | None:
+        if tier == "cheap":
+            return self.cheap or self.standard
+        if tier == "standard":
+            return self.standard or self.cheap
+        if tier == "strong":
+            return self.strong or self.standard or self.cheap
+        if tier == "max":
+            return self.max or self.strong or self.standard or self.cheap
+        return self.standard or self.cheap
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    claude: ClaudeModelConfig = field(default_factory=ClaudeModelConfig)
+    codex: CodexModelConfig = field(default_factory=CodexModelConfig)
+
+
+@dataclass(frozen=True)
+class OrchestratorBudgetConfig:
+    enabled: bool = True
+    default_task_tier: str = "auto"
+    max_tier_without_confirmation: str = "strong"
+    allow_max_tier: bool = True
+    require_confirmation_for_max_tier: bool = True
+    monthly_token_budget: int | None = None
+    daily_token_budget: int | None = None
+    per_task_token_budget: dict[str, int] = field(
+        default_factory=lambda: {
+            "trivial": 2000,
+            "small": 8000,
+            "medium": 25000,
+            "large": 60000,
+            "critical": 100000,
+        }
+    )
 
 
 @dataclass(frozen=True)
@@ -127,6 +202,29 @@ class Config:
     slack_history_limit: int = 20
     slack_target_chat_ids: set[int] = field(default_factory=set)
     slack_desktop_notifications: bool = True
+    orchestrator_default_mode: bool = True
+    orchestrator_fallback_to_codex: bool = True
+    orchestrator_strict_mode: bool = False
+    orchestrator_debate: bool = False
+    orchestrator_max_review_rounds: int = 2
+    orchestrator_model_routing: str = "auto"
+    orchestrator_default_tier: str = "cheap"
+    orchestrator_max_auto_tier: str = "strong"
+    orchestrator_require_confirm_for_max: bool = True
+    claude_enabled: bool = True
+    claude_command: str | None = None
+    claude_timeout_seconds: int = 300
+    claude_max_tokens: int = 8000
+    memory_enabled: bool = True
+    memory_auto_extract_after_task: bool = True
+    memory_require_confirmation_for_sensitive: bool = True
+    memory_max_items_per_project_context: int = 12
+    memory_max_similar_tasks: int = 5
+    memory_redact_secrets: bool = True
+    models: ModelConfig = field(default_factory=ModelConfig)
+    orchestrator_budget: OrchestratorBudgetConfig = field(
+        default_factory=OrchestratorBudgetConfig
+    )
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -148,6 +246,28 @@ class Config:
         slack_target_chat_ids = parse_csv_ints(env.get("CODEX_SLACK_TELEGRAM_CHAT_IDS"))
         if not slack_target_chat_ids:
             slack_target_chat_ids = parse_csv_ints(chat_ids)
+        legacy_codex_model = env.get("CODEX_TELEGRAM_MODEL") or None
+        codex_models = CodexModelConfig(
+            cheap=env.get("CODEX_CHEAP_MODEL") or None,
+            standard=env.get("CODEX_STANDARD_MODEL") or legacy_codex_model,
+            strong=env.get("CODEX_STRONG_MODEL") or legacy_codex_model,
+            max=env.get("CODEX_MAX_MODEL") or None,
+        )
+        claude_models = ClaudeModelConfig(
+            cheap=env.get("CLAUDE_CHEAP_MODEL") or None,
+            standard=env.get("CLAUDE_STANDARD_MODEL")
+            or env.get("CLAUDE_ARCHITECT_MODEL")
+            or env.get("CLAUDE_REVIEWER_MODEL")
+            or None,
+            strong=env.get("CLAUDE_STRONG_MODEL") or None,
+        )
+        per_task_budget = OrchestratorBudgetConfig().per_task_token_budget
+        for key in list(per_task_budget):
+            override = parse_optional_int(
+                env.get(f"CODEX_ORCHESTRATOR_BUDGET_{key.upper()}_TOKENS")
+            )
+            if override is not None:
+                per_task_budget[key] = override
         return cls(
             bot_token=bot_token,
             allowed_chat_ids=allowed_chat_ids,
@@ -167,7 +287,7 @@ class Config:
                 )
             ).expanduser(),
             codex_bin=env.get("CODEX_TELEGRAM_CODEX_BIN", "codex"),
-            model=env.get("CODEX_TELEGRAM_MODEL") or None,
+            model=legacy_codex_model,
             poll_timeout_seconds=int(env.get("CODEX_TELEGRAM_POLL_TIMEOUT", "30")),
             prompt_debounce_seconds=float(
                 env.get("CODEX_TELEGRAM_PROMPT_DEBOUNCE_SECONDS", "3")
@@ -213,6 +333,103 @@ class Config:
             slack_desktop_notifications=parse_bool(
                 env.get("CODEX_SLACK_DESKTOP_NOTIFICATIONS"),
                 True,
+            ),
+            orchestrator_default_mode=parse_bool(
+                env.get("CODEX_TELEGRAM_ORCHESTRATOR")
+                or env.get("CODEX_ORCHESTRATOR"),
+                True,
+            ),
+            orchestrator_fallback_to_codex=parse_bool(
+                env.get("CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX"),
+                True,
+            ),
+            orchestrator_strict_mode=parse_bool(
+                env.get("CODEX_ORCHESTRATOR_STRICT_MODE"),
+                False,
+            ),
+            orchestrator_debate=parse_bool(
+                env.get("CODEX_ORCHESTRATOR_DEBATE"),
+                False,
+            ),
+            orchestrator_max_review_rounds=max(
+                0,
+                int(env.get("CODEX_ORCHESTRATOR_MAX_REVIEW_ROUNDS", "2")),
+            ),
+            orchestrator_model_routing=(
+                env.get("CODEX_ORCHESTRATOR_MODEL_ROUTING", "auto").strip().lower()
+                or "auto"
+            ),
+            orchestrator_default_tier=normalize_tier(
+                env.get("CODEX_ORCHESTRATOR_DEFAULT_TIER"),
+                "cheap",
+            ),
+            orchestrator_max_auto_tier=normalize_tier(
+                env.get("CODEX_ORCHESTRATOR_MAX_AUTO_TIER"),
+                "strong",
+            ),
+            orchestrator_require_confirm_for_max=parse_bool(
+                env.get("CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX"),
+                True,
+            ),
+            claude_enabled=parse_bool(env.get("CODEX_CLAUDE_ENABLED"), True),
+            claude_command=(
+                env.get("CODEX_CLAUDE_CMD")
+                or env.get("CODEX_TELEGRAM_CLAUDE_CMD")
+                or env.get("CLAUDE_CMD")
+                or None
+            ),
+            claude_timeout_seconds=max(
+                1,
+                int(env.get("CODEX_CLAUDE_TIMEOUT_SECONDS", "300")),
+            ),
+            claude_max_tokens=max(
+                1,
+                int(env.get("CODEX_CLAUDE_MAX_TOKENS", "8000")),
+            ),
+            memory_enabled=parse_bool(env.get("CODEX_MEMORY_ENABLED"), True),
+            memory_auto_extract_after_task=parse_bool(
+                env.get("CODEX_MEMORY_AUTO_EXTRACT_AFTER_TASK"),
+                True,
+            ),
+            memory_require_confirmation_for_sensitive=parse_bool(
+                env.get("CODEX_MEMORY_REQUIRE_CONFIRMATION_FOR_SENSITIVE"),
+                True,
+            ),
+            memory_max_items_per_project_context=max(
+                1,
+                int(env.get("CODEX_MEMORY_MAX_ITEMS_PER_PROJECT_CONTEXT", "12")),
+            ),
+            memory_max_similar_tasks=max(
+                1,
+                int(env.get("CODEX_MEMORY_MAX_SIMILAR_TASKS", "5")),
+            ),
+            memory_redact_secrets=parse_bool(env.get("CODEX_MEMORY_REDACT_SECRETS"), True),
+            models=ModelConfig(claude=claude_models, codex=codex_models),
+            orchestrator_budget=OrchestratorBudgetConfig(
+                enabled=parse_bool(env.get("CODEX_ORCHESTRATOR_BUDGET_ENABLED"), True),
+                default_task_tier=normalize_tier(
+                    env.get("CODEX_ORCHESTRATOR_BUDGET_DEFAULT_TASK_TIER"),
+                    "auto",
+                ),
+                max_tier_without_confirmation=normalize_tier(
+                    env.get("CODEX_ORCHESTRATOR_MAX_TIER_WITHOUT_CONFIRMATION"),
+                    "strong",
+                ),
+                allow_max_tier=parse_bool(
+                    env.get("CODEX_ORCHESTRATOR_ALLOW_MAX_TIER"),
+                    True,
+                ),
+                require_confirmation_for_max_tier=parse_bool(
+                    env.get("CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX"),
+                    True,
+                ),
+                monthly_token_budget=parse_optional_int(
+                    env.get("CODEX_ORCHESTRATOR_MONTHLY_TOKEN_BUDGET")
+                ),
+                daily_token_budget=parse_optional_int(
+                    env.get("CODEX_ORCHESTRATOR_DAILY_TOKEN_BUDGET")
+                ),
+                per_task_token_budget=per_task_budget,
             ),
         )
 

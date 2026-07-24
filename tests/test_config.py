@@ -73,6 +73,9 @@ EMPTY=
         self.assertEqual(config.allowed_user_ids, {123})
         self.assertEqual(str(config.workspace_root), "/workspace")
         self.assertTrue(config.recover_interrupted_tasks)
+        self.assertTrue(config.orchestrator_default_mode)
+        self.assertEqual(config.orchestrator_default_tier, "cheap")
+        self.assertEqual(config.orchestrator_max_auto_tier, "strong")
 
     def test_interrupted_task_recovery_can_be_disabled(self) -> None:
         with patch.dict(
@@ -88,6 +91,32 @@ EMPTY=
             config = Config.from_env()
 
         self.assertFalse(config.recover_interrupted_tasks)
+
+    def test_orchestrator_config_can_be_disabled_and_maps_models(self) -> None:
+        with patch.dict(
+            os.environ,
+            {
+                "HOME": "/tmp/codex-test-home",
+                "CODEX_TELEGRAM_BOT_TOKEN": "token",
+                "CODEX_TELEGRAM_CHAT_ID": "123",
+                "CODEX_TELEGRAM_ORCHESTRATOR": "off",
+                "CODEX_ORCHESTRATOR_DEBATE": "off",
+                "CODEX_ORCHESTRATOR_DEFAULT_TIER": "standard",
+                "CODEX_ORCHESTRATOR_MAX_AUTO_TIER": "strong",
+                "CODEX_CHEAP_MODEL": "codex-cheap",
+                "CODEX_STANDARD_MODEL": "codex-standard",
+                "CLAUDE_CHEAP_MODEL": "claude-cheap",
+                "CLAUDE_STANDARD_MODEL": "claude-standard",
+            },
+            clear=True,
+        ):
+            config = Config.from_env()
+
+        self.assertFalse(config.orchestrator_default_mode)
+        self.assertFalse(config.orchestrator_debate)
+        self.assertEqual(config.orchestrator_default_tier, "standard")
+        self.assertEqual(config.models.codex.for_tier("cheap"), "codex-cheap")
+        self.assertEqual(config.models.claude.for_tier("standard"), "claude-standard")
 
     def test_explicit_allowed_user_ids_override_private_default(self) -> None:
         with patch.dict(

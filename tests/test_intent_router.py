@@ -33,6 +33,12 @@ class IntentRouterTest(unittest.TestCase):
         self.assertEqual(result.intent, "confirm_execution")
         self.assertEqual(result.task_id, "task-2")
 
+    def test_continue_task_with_query_is_detected(self) -> None:
+        result = self.router.route("продолжи задачу про авторизацию")
+
+        self.assertEqual(result.intent, "continue_task")
+        self.assertEqual(result.task_text, "задачу про авторизацию")
+
     def test_remember_and_alias_intents_require_confirmation(self) -> None:
         remember = self.router.route("Запомни: source repo главный")
         alias = self.router.route("Называй codex-assistant просто бот")
