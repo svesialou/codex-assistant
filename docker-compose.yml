@@ -3,7 +3,7 @@ services:
     build:
       context: .
       args:
-        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.135.0}
+        CODEX_CLI_VERSION: ${CODEX_CLI_VERSION:-0.145.0}
     image: codex-assistant:local
     container_name: codex-telegram-bot
     command: >

@@ -4,10 +4,11 @@ import os
 import re
 import secrets
 import signal
+import shlex
 import subprocess
 from pathlib import Path
 
-from .config import Config
+from .config import Config, normalize_task_provider
 from .project_index import ProjectInfo
 from .task_store import TaskRecord, TaskStore, process_start_time
 
@@ -380,6 +381,23 @@ class CodexRunner:
         env["CODEX_TELEGRAM_SUPPRESS_STOP_HOOK"] = "1"
         return env
 
+    def _claude_command(self, model: str | None = None) -> list[str]:
+        command_text = self.config.claude_executor_command
+        has_model_placeholder = "{model}" in command_text
+        if has_model_placeholder:
+            command_text = command_text.format(model=model or "")
+        command = shlex.split(command_text)
+        if model and not has_model_placeholder:
+            command.extend(["--model", model])
+        return command
+
+    def _claude_env(self, model: str | None = None) -> dict[str, str]:
+        env = self._command_env()
+        if model:
+            env["LLM_MODEL"] = model
+            env["CLAUDE_MODEL"] = model
+        return env
+
     def _base_command(
         self,
         project_path: str,
@@ -498,10 +516,13 @@ class CodexRunner:
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = "codex",
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / "final.md"
         log_path = task_dir / "run.log"
@@ -513,6 +534,19 @@ class CodexRunner:
 
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
+
+        if provider == "claude":
+            return self._run_claude_execution(
+                task,
+                project,
+                prompt_path,
+                final_path,
+                log_path,
+                model=model,
+                timeout_seconds=self.config.run_timeout_seconds,
+                timeout_error="Execution timed out.",
+                failed_error_prefix="Execution failed",
+            )
 
         command = self._base_command(task.project_path, final_path, model=model)
         command.extend(["-s", "danger-full-access", "-"])
@@ -551,10 +585,13 @@ class CodexRunner:
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = "codex",
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task.recovery_attempts += 1
         task_dir = self.store.task_dir(task.id)
         final_path = Path(task.final_path) if task.final_path else task_dir / "final.md"
@@ -579,6 +616,19 @@ class CodexRunner:
             ),
             encoding="utf-8",
         )
+
+        if provider == "claude":
+            return self._run_claude_execution(
+                task,
+                project,
+                prompt_path,
+                final_path,
+                log_path,
+                model=model,
+                timeout_seconds=self.config.run_timeout_seconds,
+                timeout_error="Recovered execution timed out.",
+                failed_error_prefix="Recovered execution failed",
+            )
 
         resume_session_id = task.codex_session_id
         if resume_session_id:
@@ -685,10 +735,13 @@ class CodexRunner:
         project: ProjectInfo,
         round_number: int,
         model: str | None = None,
+        provider: str = "codex",
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / f"final-revision-{round_number}.md"
         log_path = task_dir / "run.log"
@@ -700,6 +753,19 @@ class CodexRunner:
 
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
+
+        if provider == "claude":
+            return self._run_claude_execution(
+                task,
+                project,
+                prompt_path,
+                final_path,
+                log_path,
+                model=model,
+                timeout_seconds=self.config.run_timeout_seconds,
+                timeout_error="Revision execution timed out.",
+                failed_error_prefix="Revision execution failed",
+            )
 
         resume_session_id = task.codex_session_id
         if resume_session_id:
@@ -734,6 +800,61 @@ class CodexRunner:
                     task.error = f"Revision execution failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or resume_session_id
+        self._mark_process_finished(task)
+        return task
+
+    def _run_claude_execution(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        prompt_path: Path,
+        final_path: Path,
+        log_path: Path,
+        model: str | None,
+        timeout_seconds: int | None,
+        timeout_error: str,
+        failed_error_prefix: str,
+    ) -> TaskRecord:
+        del project
+        command = self._claude_command(model=model)
+        if not command:
+            task.phase = "failed"
+            task.error = "Claude executor command is empty."
+            self.store.save_task(task)
+            return task
+
+        with prompt_path.open("rb") as stdin, final_path.open("wb") as stdout, log_path.open("ab") as log:
+            log.write(b"\n[Claude executor started]\n")
+            try:
+                process = subprocess.Popen(
+                    command,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=log,
+                    cwd=task.project_path,
+                    start_new_session=True,
+                    env=self._claude_env(model=model),
+                )
+            except OSError as exc:
+                task.phase = "failed"
+                task.error = f"Claude execution failed to start: {exc}"
+                self.store.save_task(task)
+                return task
+            self._mark_process_started(task, process)
+            try:
+                returncode = process.wait(timeout=timeout_seconds)
+            except subprocess.TimeoutExpired:
+                returncode = wait_after_stop(process)
+                task.phase = "failed"
+                task.error = timeout_error
+            else:
+                task.returncode = returncode
+                if returncode == 0:
+                    task.phase = "completed"
+                else:
+                    task.phase = "failed"
+                    task.error = f"{failed_error_prefix} with exit code {returncode}."
+
         self._mark_process_finished(task)
         return task
 

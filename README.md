@@ -144,7 +144,7 @@ CODEX_HOST_WORKSPACE_ROOT=/home/your-user
 CODEX_TELEGRAM_PROJECT_DIRS=/home/your-user/Projects:/home/your-user/MyProjects
 HOST_UID=1000
 HOST_GID=1000
-CODEX_CLI_VERSION=0.135.0
+CODEX_CLI_VERSION=0.145.0
 ```
 
 If your projects live elsewhere, set `CODEX_HOST_WORKSPACE_ROOT` to their common
@@ -236,7 +236,9 @@ CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX=1
 CODEX_ORCHESTRATOR_DEBATE=0
 CODEX_ORCHESTRATOR_MAX_REVIEW_ROUNDS=2
 CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX=1
+CODEX_TELEGRAM_TASK_PROVIDER=codex   # codex or claude
 CODEX_CLAUDE_CMD='your-claude-wrapper'
+CODEX_CLAUDE_EXEC_CMD='claude -p --output-format text --permission-mode bypassPermissions'
 CLAUDE_CHEAP_MODEL=
 CLAUDE_STANDARD_MODEL=
 CLAUDE_STRONG_MODEL=
@@ -248,6 +250,10 @@ CODEX_MAX_MODEL=
 
 Claude transport is optional. If it is not configured and fallback is enabled,
 orchestrated tasks run through Codex-only flow with a Telegram warning.
+`CODEX_TELEGRAM_TASK_PROVIDER=claude` makes Claude Code the main executor for
+task implementation. It uses `CODEX_CLAUDE_EXEC_CMD`, which defaults to the
+local `claude -p` CLI command. Telegram Settings can override the executor per
+chat without editing the env file.
 
 Interrupted task recovery:
 

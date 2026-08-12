@@ -16,6 +16,7 @@ from codex_telegram_bot.bot import (
     main_menu_keyboard,
     process_summary,
     running_task_keyboard,
+    settings_keyboard,
     tasks_keyboard,
 )
 from codex_telegram_bot.config import Config
@@ -126,6 +127,23 @@ class BotUiTest(unittest.TestCase):
         ]
         self.assertIn("tasks:active", callbacks)
         self.assertIn("tasks:failed", callbacks)
+
+    def test_settings_keyboard_has_task_provider_toggle(self) -> None:
+        keyboard = settings_keyboard(
+            orchestrator_enabled=True,
+            debug_enabled=False,
+            memory_enabled=True,
+            task_provider="claude",
+        )
+        callbacks = [
+            button["callback_data"]
+            for row in keyboard["inline_keyboard"]
+            for button in row
+        ]
+        labels = [button["text"] for row in keyboard["inline_keyboard"] for button in row]
+
+        self.assertIn("settings:task_provider_toggle", callbacks)
+        self.assertIn("Executor: CLAUDE", labels)
 
     def test_inline_task_keyboard_has_attachment_and_answer_actions(self) -> None:
         keyboard = inline_task_keyboard("task-1")
@@ -349,6 +367,22 @@ class BotUiTest(unittest.TestCase):
         self.assertTrue(on_state.orchestrator_mode)
         self.assertIn("Orchestrator: OFF", sent[0])
         self.assertIn("Orchestrator: ON", sent[-1])
+
+    def test_settings_provider_command_sets_chat_executor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            sent: list[str] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text) or 1
+
+            bot.dispatch_command(10, 20, "/settings", "provider claude")
+            claude_state = bot.store.load_chat_state(10)
+            bot.dispatch_command(10, 20, "/settings", "provider codex")
+            codex_state = bot.store.load_chat_state(10)
+
+        self.assertEqual(claude_state.task_provider, "claude")
+        self.assertEqual(codex_state.task_provider, "codex")
+        self.assertIn("Task provider: claude", sent[0])
 
     def test_recover_interrupted_tasks_queues_stale_running_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

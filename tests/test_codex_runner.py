@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -177,6 +178,63 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn('sandbox_mode="danger-full-access"', command)
         self.assertIn("gpt-test", command)
         self.assertEqual(command[-2:], ["019e7842-d41f-72b3-9394-911a9c490cb4", "-"])
+
+    def test_claude_execution_writes_stdout_to_final(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            project_dir = Path(tmp) / "project"
+            project_dir.mkdir()
+            config = Config(
+                bot_token="token",
+                allowed_chat_ids={1},
+                allowed_user_ids=set(),
+                project_roots=[],
+                index_dir=Path(tmp) / "index",
+                state_dir=Path(tmp) / "state",
+                codex_bin="codex",
+                model=None,
+                poll_timeout_seconds=30,
+                prompt_debounce_seconds=60,
+                plan_timeout_seconds=60,
+                run_timeout_seconds=30,
+                transcribe_command=None,
+                transcribe_timeout_seconds=300,
+                env_file=Path(tmp) / "telegram.env",
+                claude_executor_command=(
+                    f"{sys.executable} -c \"import sys; "
+                    "sys.stdin.read(); print('CLAUDE_DONE')\""
+                ),
+            )
+            runner = CodexRunner(config, TaskStore(config.state_dir))
+            project = ProjectInfo(
+                slug="demo",
+                name="demo",
+                path=str(project_dir),
+                base=tmp,
+                is_git=False,
+                branch=None,
+                origin=None,
+                languages=[],
+                markers=[],
+                docs=[],
+                test_hints=[],
+            )
+            task = TaskRecord(
+                id="task-1",
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path=str(project_dir),
+                prompt="implement with claude",
+            )
+            runner.store.save_task(task)
+
+            result = runner.run_execution(task, project, provider="claude")
+            final_text = Path(result.final_path).read_text(encoding="utf-8").strip()
+
+        self.assertEqual(result.phase, "completed")
+        self.assertEqual(result.executor_provider, "claude")
+        self.assertEqual(final_text, "CLAUDE_DONE")
 
     def test_continuation_prompt_includes_parent_and_followup(self) -> None:
         parent = TaskRecord(

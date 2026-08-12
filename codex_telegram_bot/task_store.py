@@ -54,6 +54,7 @@ class TaskRecord:
     last_run_summary: str = ""
     next_actions: list[str] = field(default_factory=list)
     model_routing: dict[str, Any] = field(default_factory=dict)
+    executor_provider: str = ""
     memory_refs: list[str] = field(default_factory=list)
     trace_id: str = ""
     orchestrator_enabled: bool = False
@@ -84,6 +85,7 @@ class ChatState:
     agent_mode: bool = False
     agent_conversation_mode: bool = True
     orchestrator_mode: bool | None = None
+    task_provider: str | None = None
     debug_mode: bool = False
     memory_enabled: bool | None = None
     orchestrator_default_tier: str = "auto"

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -11,7 +11,12 @@ from ..config import Config
 from ..project_index import ProjectInfo
 from ..task_store import TaskRecord, TaskStore, now_iso
 from .llm_provider import LlmProvider, LlmProviderUnavailable, LlmRequest
-from .model_router import ModelRouter, RoutingDecision, render_routing_decision
+from .model_router import (
+    ModelRouter,
+    RoutingDecision,
+    render_routing_decision,
+    render_selected_flow,
+)
 from .project_memory_engine import ProjectMemoryEngine
 from .redaction import RedactionService
 
@@ -123,11 +128,16 @@ class OrchestratorService:
         project: ProjectInfo,
         orchestrator_enabled: bool,
         recover: bool = False,
+        executor_provider: str = "codex",
         notify: Callable[[str], None] | None = None,
         append_event: Callable[..., None] | None = None,
     ) -> TaskRecord:
         manual_tier = str(task.model_routing.get("manual_tier") or "auto")
-        decision = self.model_router.route(task, manual_tier=manual_tier)
+        decision = self.model_router.route(
+            task,
+            manual_tier=manual_tier,
+            executor_provider=executor_provider,
+        )
         self._record_routing(task, decision, orchestrator_enabled)
         self._append_event(
             append_event,
@@ -140,19 +150,38 @@ class OrchestratorService:
             notify(render_routing_decision(decision))
 
         if not orchestrator_enabled:
-            return self._run_codex(task, project, decision, recover=recover)
+            return self._run_executor(task, project, decision, recover=recover)
 
-        if not decision.classification.requires_architect and not decision.classification.requires_reviewer:
+        if not self._executor_available(decision):
+            if self.config.orchestrator_strict_mode or not self.config.orchestrator_fallback_to_codex:
+                task.phase = "failed"
+                task.error = "Claude executor is unavailable and fallback is disabled."
+                self.store.save_task(task)
+                self._save_trace(task, decision, final_status="failed")
+                return task
             self._append_event(
                 append_event,
                 task.id,
                 "Orchestrator",
-                "Cheap path selected: Codex-only flow.",
+                "Claude executor unavailable; falling back to Codex executor.",
+                {"fallback_to_codex": True},
+            )
+            if notify is not None:
+                notify("Claude executor недоступен. Перехожу на Codex по fallback-настройке.")
+            decision = self._fallback_to_codex_decision(task, decision)
+
+        if not decision.classification.requires_architect and not decision.classification.requires_reviewer:
+            executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+            self._append_event(
+                append_event,
+                task.id,
+                "Orchestrator",
+                f"Cheap path selected: {executor_name}-only flow.",
                 None,
             )
-            return self._run_codex(task, project, decision, recover=recover)
+            return self._run_executor(task, project, decision, recover=recover)
 
-        if not self._claude_available(decision):
+        if not self._claude_orchestrator_available(decision):
             if self.config.orchestrator_strict_mode or not self.config.orchestrator_fallback_to_codex:
                 task.phase = "failed"
                 task.error = "Claude orchestrator is unavailable and fallback is disabled."
@@ -163,12 +192,14 @@ class OrchestratorService:
                 append_event,
                 task.id,
                 "Orchestrator",
-                "Claude unavailable; falling back to Codex-only flow.",
-                {"fallback_to_codex": True},
+                "Claude architect/reviewer unavailable; running executor-only flow.",
+                {"executor_provider": decision.executor_provider},
             )
             if notify is not None:
-                notify("Claude недоступен. Перехожу в Codex-only flow по fallback-настройке.")
-            task = self._run_codex(task, project, decision, recover=recover)
+                executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+                notify(f"Claude architect/reviewer недоступен. Запускаю {executor_name}-only flow.")
+            decision = self._without_claude_roles_decision(task, decision)
+            task = self._run_executor(task, project, decision, recover=recover)
             self._save_trace(
                 task,
                 decision,
@@ -216,9 +247,10 @@ class OrchestratorService:
             if notify is not None:
                 notify("Claude architect: составил план.")
 
-        task = self._run_codex(task, project, decision, recover=recover)
+        task = self._run_executor(task, project, decision, recover=recover)
         if notify is not None:
-            notify("Codex: завершил реализацию." if task.phase == "completed" else "Codex: выполнение завершилось ошибкой.")
+            executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+            notify(f"{executor_name}: завершил реализацию." if task.phase == "completed" else f"{executor_name}: выполнение завершилось ошибкой.")
         if task.phase != "completed" or not decision.classification.requires_reviewer:
             self._save_trace(
                 task,
@@ -308,6 +340,7 @@ class OrchestratorService:
                 project,
                 review_round,
                 model=decision.selected_models.get("executor"),
+                provider=decision.executor_provider,
             )
 
         return task
@@ -323,7 +356,7 @@ class OrchestratorService:
         task.trace_id = task.trace_id or f"trace-{task.id}"
         self.store.save_task(task)
 
-    def _run_codex(
+    def _run_executor(
         self,
         task: TaskRecord,
         project: ProjectInfo,
@@ -332,18 +365,78 @@ class OrchestratorService:
     ) -> TaskRecord:
         model = decision.selected_models.get("executor")
         if recover:
-            return self.runner.run_recovery_execution(task, project, model=model)
-        return self.runner.run_execution(task, project, model=model)
+            return self.runner.run_recovery_execution(
+                task,
+                project,
+                model=model,
+                provider=decision.executor_provider,
+            )
+        return self.runner.run_execution(
+            task,
+            project,
+            model=model,
+            provider=decision.executor_provider,
+        )
 
-    def _claude_available(self, decision: RoutingDecision) -> bool:
+    def _executor_available(self, decision: RoutingDecision) -> bool:
+        if decision.executor_provider != "claude":
+            return True
         if not self.config.claude_enabled:
             return False
-        if not self.config.claude_command:
-            return False
-        return bool(
+        return bool(self.config.claude_executor_command)
+
+    def _claude_orchestrator_available(self, decision: RoutingDecision) -> bool:
+        if not (
             decision.classification.requires_architect
             or decision.classification.requires_reviewer
+        ):
+            return True
+        if not self.config.claude_enabled:
+            return False
+        return bool(self.config.claude_command)
+
+    def _fallback_to_codex_decision(
+        self,
+        task: TaskRecord,
+        decision: RoutingDecision,
+    ) -> RoutingDecision:
+        fallback = self.model_router.route(
+            task,
+            manual_tier=decision.manual_tier,
+            executor_provider="codex",
         )
+        self._record_routing(task, fallback, task.orchestrator_enabled)
+        return fallback
+
+    def _without_claude_roles_decision(
+        self,
+        task: TaskRecord,
+        decision: RoutingDecision,
+    ) -> RoutingDecision:
+        classification = replace(
+            decision.classification,
+            requires_architect=False,
+            requires_reviewer=False,
+            requires_debate=False,
+            recommended_claude_architect_tier="none",
+            recommended_claude_reviewer_tier="none",
+            max_review_rounds=0,
+        )
+        selected_models = dict(decision.selected_models)
+        selected_models["architect"] = None
+        selected_models["reviewer"] = None
+        routed = replace(
+            decision,
+            classification=classification,
+            selected_flow=render_selected_flow(classification, decision.executor_provider),
+            selected_models=selected_models,
+            warnings=[
+                *decision.warnings,
+                "Claude architect/reviewer unavailable; executor-only flow selected.",
+            ],
+        )
+        self._record_routing(task, routed, task.orchestrator_enabled)
+        return routed
 
     def _run_architect(
         self,
@@ -406,10 +499,11 @@ class OrchestratorService:
             self.store.save_task(task)
             self._save_trace(task, decision, final_status="failed")
             return task
-        task = self._run_codex(task, project, decision, recover=recover)
+        fallback = self._fallback_to_codex_decision(task, decision)
+        task = self._run_executor(task, project, fallback, recover=recover)
         self._save_trace(
             task,
-            decision,
+            fallback,
             codex_summary=read_final(task),
             final_status="done" if task.phase == "completed" else "failed",
         )
@@ -442,6 +536,7 @@ class OrchestratorService:
             "architect_model": decision.selected_models.get("architect"),
             "reviewer_model": decision.selected_models.get("reviewer"),
             "codex_model": decision.selected_models.get("executor"),
+            "executor_provider": decision.executor_provider,
             "architect_plan": asdict(architect_plan) if architect_plan else None,
             "codex_summary": codex_summary[:4000],
             "review_verdict": review.verdict if review else None,

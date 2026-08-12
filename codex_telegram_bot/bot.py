@@ -10,12 +10,13 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any
 
 from .activity_status import extract_codex_activity, render_codex_status
 from .agent_roles import AGENT_ROLES
-from .config import Config
+from .config import Config, normalize_task_provider
 from .codex_runner import CodexRunner, extract_session_id
 from .project_index import (
     ProjectInfo,
@@ -89,6 +90,7 @@ Commands:
 /orchestrator_off - disable orchestration and use Codex-only flow
 /orchestrator_status - show orchestration status
 /settings orchestrator on|off|status - manage orchestration
+/settings provider codex|claude|status - choose main task executor
 /debug on|off - toggle debug trace details
 /ask <text> - ask Codex in read-only agent mode
 /task <project> <text> - create a Codex task in a project
@@ -351,13 +353,16 @@ def settings_keyboard(
     orchestrator_enabled: bool,
     debug_enabled: bool,
     memory_enabled: bool,
+    task_provider: str,
 ) -> dict[str, Any]:
     orchestrator_label = "Orchestrator: ON" if orchestrator_enabled else "Orchestrator: OFF"
+    provider_label = f"Executor: {task_provider.upper()}"
     debug_label = "Debug: ON" if debug_enabled else "Debug: OFF"
     memory_label = "Memory: ON" if memory_enabled else "Memory: OFF"
     return {
         "inline_keyboard": [
             [{"text": orchestrator_label, "callback_data": "settings:orchestrator_toggle"}],
+            [{"text": provider_label, "callback_data": "settings:task_provider_toggle"}],
             [{"text": memory_label, "callback_data": "settings:memory_toggle"}],
             [{"text": debug_label, "callback_data": "settings:debug_toggle"}],
             [
@@ -532,6 +537,7 @@ def render_task_routing(routing: dict[str, Any]) -> str:
         lines.append("- selected models:")
         for key in ["classifier", "architect", "executor", "reviewer"]:
             lines.append(f"  {key}: {selected_models.get(key) or 'none'}")
+    lines.append(f"- executor provider: {routing.get('executor_provider') or '-'}")
     warnings = routing.get("warnings") or []
     for warning in warnings:
         lines.append(f"- warning: {warning}")
@@ -739,6 +745,10 @@ class CodexTelegramBot:
         if state.memory_enabled is None:
             return self.config.memory_enabled
         return state.memory_enabled
+
+    def effective_task_provider(self, chat_id: int) -> str:
+        state = self.store.load_chat_state(chat_id)
+        return normalize_task_provider(state.task_provider or self.config.task_provider)
 
     def task_context_project_slugs(
         self,
@@ -1221,6 +1231,7 @@ class CodexTelegramBot:
         state = self.store.load_chat_state(chat_id)
         orchestrator = self.effective_orchestrator_mode(chat_id)
         memory = self.effective_memory_mode(chat_id)
+        task_provider = self.effective_task_provider(chat_id)
         self.send(
             chat_id,
             "\n".join(
@@ -1233,17 +1244,23 @@ class CodexTelegramBot:
                     f"Review rounds: {self.config.orchestrator_max_review_rounds}",
                     f"Debate: {'ON' if self.config.orchestrator_debate else 'OFF'}",
                     f"Fallback to Codex: {'ON' if self.config.orchestrator_fallback_to_codex else 'OFF'}",
+                    f"Task provider: {task_provider}",
+                    f"Claude executor: {'configured' if self.config.claude_executor_command else 'not configured'}",
                     f"Memory: {'ON' if memory else 'OFF'}",
                     f"Debug: {'ON' if state.debug_mode else 'OFF'}",
                 ]
             ),
-            reply_markup=settings_keyboard(orchestrator, state.debug_mode, memory),
+            reply_markup=settings_keyboard(orchestrator, state.debug_mode, memory, task_provider),
         )
 
     def handle_settings_callback(self, chat_id: int, value: str) -> None:
         state = self.store.load_chat_state(chat_id)
         if value == "orchestrator_toggle":
             state.orchestrator_mode = not self.effective_orchestrator_mode(chat_id)
+        elif value == "task_provider_toggle":
+            state.task_provider = (
+                "claude" if self.effective_task_provider(chat_id) == "codex" else "codex"
+            )
         elif value == "memory_toggle":
             state.memory_enabled = not self.effective_memory_mode(chat_id)
         elif value == "debug_toggle":
@@ -1379,6 +1396,7 @@ class CodexTelegramBot:
                 self.effective_orchestrator_mode(chat_id),
                 self.store.load_chat_state(chat_id).debug_mode,
                 self.effective_memory_mode(chat_id),
+                self.effective_task_provider(chat_id),
             ),
         )
 
@@ -1387,12 +1405,12 @@ class CodexTelegramBot:
         if enabled:
             return (
                 "Orchestrator: ON\n"
-                "Claude будет использоваться как архитектор и ревьюер перед запуском Codex, "
-                "если ModelRouter решит, что это нужно."
+                "Claude будет использоваться как архитектор и ревьюер, если ModelRouter решит, "
+                "что это нужно. Основной executor берётся из настройки Task provider."
             )
         return (
             "Orchestrator: OFF\n"
-            "Задачи будут выполняться напрямую через Codex, как раньше."
+            f"Задачи будут выполняться напрямую через {self.effective_task_provider(chat_id)}."
         )
 
     def settings_command(self, chat_id: int, args: str) -> None:
@@ -1407,10 +1425,33 @@ class CodexTelegramBot:
                 return
             self.orchestrator_command(chat_id, action)
             return
+        if parts[0] == "provider":
+            action = parts[1] if len(parts) > 1 else "status"
+            if action not in {"codex", "claude", "status"}:
+                self.send(chat_id, "Usage: /settings provider codex|claude|status")
+                return
+            self.task_provider_command(chat_id, action)
+            return
         if parts[0] == "debug":
             self.debug_command(chat_id, parts[1] if len(parts) > 1 else "status")
             return
-        self.send(chat_id, "Usage: /settings orchestrator on|off|status")
+        self.send(chat_id, "Usage: /settings orchestrator on|off|status | provider codex|claude|status")
+
+    def task_provider_command(self, chat_id: int, action: str) -> None:
+        state = self.store.load_chat_state(chat_id)
+        if action in {"codex", "claude"}:
+            state.task_provider = action
+            self.store.save_chat_state(state)
+        self.send(
+            chat_id,
+            f"Task provider: {self.effective_task_provider(chat_id)}",
+            reply_markup=settings_keyboard(
+                self.effective_orchestrator_mode(chat_id),
+                self.store.load_chat_state(chat_id).debug_mode,
+                self.effective_memory_mode(chat_id),
+                self.effective_task_provider(chat_id),
+            ),
+        )
 
     def debug_command(self, chat_id: int, args: str) -> None:
         value = args.strip().lower()
@@ -3214,18 +3255,20 @@ class CodexTelegramBot:
         state.pending_action = None
         state.last_task_id = task.id
         self.store.save_chat_state(state)
+        provider = self.effective_task_provider(chat_id)
         if self.effective_orchestrator_mode(chat_id):
+            executor_name = "Claude" if provider == "claude" else "Codex"
             activity = (
                 "Orchestrator mode включён.\n\n"
                 "1. ModelRouter выберет минимально достаточный tier.\n"
                 "2. Claude подготовит план, если это нужно.\n"
-                "3. Codex выполнит реализацию.\n"
+                f"3. {executor_name} выполнит реализацию.\n"
                 "4. Claude проверит diff, если review нужен."
             )
         else:
             activity = (
                 f"Direct execution task {task.id} created for {project.slug}. "
-                "Запускаю Codex execution."
+                f"Запускаю {provider} execution."
             )
         status_message_id = self.send_codex_status(
             task,
@@ -3401,11 +3444,13 @@ class CodexTelegramBot:
         if pending_task_id(state.pending_action, "attach_files") == task.id:
             state.pending_action = None
             self.store.save_chat_state(state)
-        self.append_event(task.id, "state_change", "CodexDev", "Execution confirmed by user.")
+        provider = self.effective_task_provider(chat_id)
+        agent_name = "ClaudeDev" if provider == "claude" else "CodexDev"
+        self.append_event(task.id, "state_change", agent_name, "Execution confirmed by user.")
         status_message_id = self.send_codex_status(
             task,
             "running",
-            f"Задача {task.id} подтверждена. Запускаю Codex execution.",
+            f"Задача {task.id} подтверждена. Запускаю {provider} execution.",
             reply_markup=running_task_keyboard(task.id),
         )
         self.spawn(self.execute_task, task.id, status_message_id)
@@ -3432,7 +3477,11 @@ class CodexTelegramBot:
             return
 
         log_path = self.store.task_dir(task.id) / "run.log"
-        self.append_event(task.id, "state_change", "CodexDev", "Execution started.")
+        provider = self.effective_task_provider(task.chat_id)
+        agent_name = "ClaudeDev" if provider == "claude" else "CodexDev"
+        task.executor_provider = provider
+        self.store.save_task(task)
+        self.append_event(task.id, "state_change", agent_name, "Execution started.")
         pre_snapshot = self.record_git_safety_snapshot(task, "pre-execution")
         if pre_snapshot.is_dirty:
             self.send(
@@ -3453,6 +3502,7 @@ class CodexTelegramBot:
                 project,
                 orchestrator_enabled=True,
                 recover=recover,
+                executor_provider=provider,
                 notify=lambda text: self.send(
                     task.chat_id,
                     text,
@@ -3467,9 +3517,9 @@ class CodexTelegramBot:
                 ),
             )
         elif recover:
-            task = self.runner.run_recovery_execution(task, project)
+            task = self.runner.run_recovery_execution(task, project, provider=provider)
         else:
-            task = self.runner.run_execution(task, project)
+            task = self.runner.run_execution(task, project, provider=provider)
         post_snapshot = self.record_git_safety_snapshot(task, "post-execution")
         if self.effective_memory_mode(task.chat_id):
             self.memory_engine.remember_completed_task(
@@ -3983,11 +4033,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Rebuild project index and exit.",
     )
+    parser.add_argument(
+        "--daily-summary",
+        action="store_true",
+        help="Send the previous workday activity summary and exit.",
+    )
+    parser.add_argument(
+        "--summary-date",
+        type=date.fromisoformat,
+        help="Summarize this date instead of the previous workday (YYYY-MM-DD).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print the daily summary without sending it.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    if args.daily_summary:
+        from .daily_summary import run_daily_summary_from_env
+
+        result = run_daily_summary_from_env(
+            target=args.summary_date,
+            dry_run=args.dry_run,
+        )
+        print(result if args.dry_run else "Daily summary processing completed.")
+        return 0
+
     config = Config.from_env()
     configure_logging(config.state_dir)
 

@@ -115,6 +115,13 @@ def normalize_tier(value: str | None, default: str = "auto") -> str:
     return tier
 
 
+def normalize_task_provider(value: str | None, default: str = "codex") -> str:
+    provider = (value or default).strip().lower()
+    if provider not in {"codex", "claude"}:
+        raise ValueError(f"Invalid task provider: {value}")
+    return provider
+
+
 @dataclass(frozen=True)
 class ClaudeModelConfig:
     cheap: str | None = None
@@ -211,8 +218,12 @@ class Config:
     orchestrator_default_tier: str = "cheap"
     orchestrator_max_auto_tier: str = "strong"
     orchestrator_require_confirm_for_max: bool = True
+    task_provider: str = "codex"
     claude_enabled: bool = True
     claude_command: str | None = None
+    claude_executor_command: str = (
+        "claude -p --output-format text --permission-mode bypassPermissions"
+    )
     claude_timeout_seconds: int = 300
     claude_max_tokens: int = 8000
     memory_enabled: bool = True
@@ -371,12 +382,22 @@ class Config:
                 env.get("CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX"),
                 True,
             ),
+            task_provider=normalize_task_provider(
+                env.get("CODEX_TELEGRAM_TASK_PROVIDER")
+                or env.get("CODEX_TASK_PROVIDER"),
+                "codex",
+            ),
             claude_enabled=parse_bool(env.get("CODEX_CLAUDE_ENABLED"), True),
             claude_command=(
                 env.get("CODEX_CLAUDE_CMD")
                 or env.get("CODEX_TELEGRAM_CLAUDE_CMD")
                 or env.get("CLAUDE_CMD")
                 or None
+            ),
+            claude_executor_command=(
+                env.get("CODEX_CLAUDE_EXEC_CMD")
+                or env.get("CODEX_TELEGRAM_CLAUDE_EXEC_CMD")
+                or "claude -p --output-format text --permission-mode bypassPermissions"
             ),
             claude_timeout_seconds=max(
                 1,
