@@ -9,7 +9,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -38,7 +38,7 @@ from .slack import (
 from .services.git_safety import (
     GitSnapshot,
     capture_git_snapshot,
-    force_push_current_branch,
+    is_git_repo,
     read_git_snapshot,
     snapshot_summary,
     write_git_snapshot,
@@ -140,6 +140,8 @@ BOT_COMMANDS = [
 ]
 
 PROJECT_PAGE_SIZE = 8
+PROJECT_CANDIDATE_MIN_CONFIDENCE = 0.3
+PROJECT_CHOICE_TTL_SECONDS = 900.0
 TASK_FILTERS: dict[str, set[str] | None] = {
     "active": {"created", "planning", "planned", "running", "agent_running", "needs_human"},
     "planned": {"planned"},
@@ -734,6 +736,130 @@ class CodexTelegramBot:
         projects = self.current_projects(chat_id)
         return projects[0] if projects else None
 
+    def resolve_task_project(self, chat_id: int, text: str):
+        with self._projects_lock:
+            projects = list(self.projects)
+        return self.project_resolver.resolve(
+            text,
+            projects,
+            default_project=self.current_project(chat_id),
+        )
+
+    def send_project_resolution_prompt(self, chat_id: int, result) -> None:
+        # Candidates are only meaningful when the resolver matched real signal in the
+        # text. The low-confidence branches return an arbitrary slice of the index,
+        # so fall back to the paginated picker there.
+        if result.candidates and result.confidence >= PROJECT_CANDIDATE_MIN_CONFIDENCE:
+            rows = [
+                [{"text": item.slug[:32], "callback_data": f"project:select:{item.slug}"}]
+                for item in result.candidates[:6]
+            ]
+            self.send(
+                chat_id,
+                "Нужно уточнить проект для задачи. Выбери репозиторий.",
+                reply_markup={"inline_keyboard": rows},
+            )
+            return
+        self.send(
+            chat_id,
+            "Не понял, в каком проекте будут изменения. Выберите проект.",
+            reply_markup=project_keyboard(list(self.projects), 0),
+        )
+
+    def remember_pending_project_choice(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+        action: str,
+        source: str,
+        source_path: str,
+        manual_tier: str,
+    ) -> None:
+        state = self.store.load_chat_state(chat_id)
+        state.pending_project_choice_action = action
+        state.pending_project_choice_user_id = user_id
+        state.pending_project_choice_text = text
+        state.pending_project_choice_source = source
+        state.pending_project_choice_source_path = source_path
+        state.pending_project_choice_manual_tier = manual_tier
+        state.pending_project_choice_at = time.time()
+        self.store.save_chat_state(state)
+
+    def take_pending_project_choice(self, chat_id: int) -> ChatState | None:
+        state = self.store.load_chat_state(chat_id)
+        pending = replace(state)
+        had_choice = bool(state.pending_project_choice_action and state.pending_project_choice_text)
+        if had_choice:
+            state.pending_project_choice_action = ""
+            state.pending_project_choice_user_id = None
+            state.pending_project_choice_text = ""
+            state.pending_project_choice_source = "text"
+            state.pending_project_choice_source_path = ""
+            state.pending_project_choice_manual_tier = "auto"
+            state.pending_project_choice_at = 0.0
+            self.store.save_chat_state(state)
+        if not had_choice:
+            return None
+        # A stale answer should not silently start a task the user asked for hours ago.
+        age = time.time() - pending.pending_project_choice_at
+        if pending.pending_project_choice_at <= 0 or age > PROJECT_CHOICE_TTL_SECONDS:
+            return None
+        return pending
+
+    def resume_pending_project_choice(self, chat_id: int, project: ProjectInfo) -> bool:
+        pending = self.take_pending_project_choice(chat_id)
+        if pending is None:
+            return False
+        self.send(chat_id, f"Ок, проект для задачи: {project.slug}.")
+        self.queue_prompt_draft(
+            chat_id,
+            pending.pending_project_choice_user_id,
+            project,
+            pending.pending_project_choice_text,
+            action=pending.pending_project_choice_action,
+            source=pending.pending_project_choice_source,
+            source_path=pending.pending_project_choice_source_path,
+            manual_tier=pending.pending_project_choice_manual_tier,
+        )
+        return True
+
+    def queue_task_prompt_resolving_project(
+        self,
+        chat_id: int,
+        user_id: int | None,
+        text: str,
+        action: str,
+        source: str,
+        source_path: str,
+        manual_tier: str = "auto",
+    ) -> bool:
+        result = self.resolve_task_project(chat_id, text)
+        if result.project is None:
+            self.remember_pending_project_choice(
+                chat_id,
+                user_id,
+                text,
+                action=action,
+                source=source,
+                source_path=source_path,
+                manual_tier=manual_tier,
+            )
+            self.send_project_resolution_prompt(chat_id, result)
+            return False
+        self.take_pending_project_choice(chat_id)
+        self.queue_prompt_draft(
+            chat_id,
+            user_id,
+            result.project,
+            text,
+            action=action,
+            source=source,
+            source_path=source_path,
+            manual_tier=manual_tier,
+        )
+        return True
+
     def effective_orchestrator_mode(self, chat_id: int) -> bool:
         state = self.store.load_chat_state(chat_id)
         if state.orchestrator_mode is None:
@@ -1314,6 +1440,10 @@ class CodexTelegramBot:
         state.pending_action = None
         self.store.save_chat_state(state)
         if len(unique_projects) == 1:
+            # The chat was asked to clarify the target repo for a task whose text is
+            # already stored; resume it instead of dropping the request.
+            if self.resume_pending_project_choice(chat_id, unique_projects[0]):
+                return
             text = (
                 f"Ок, активный проект: {unique_projects[0].slug}.\n"
                 f"{unique_projects[0].path}\n\n"
@@ -2105,32 +2235,9 @@ class CodexTelegramBot:
             self.queue_agent_prompt(chat_id, user_id, intent.task_text or original_text, source="text", source_path="")
             return True
         if intent.intent == "create_task":
-            with self._projects_lock:
-                projects = list(self.projects)
-            project_result = self.project_resolver.resolve(
-                intent.task_text or original_text,
-                projects,
-                default_project=self.current_project(chat_id),
-            )
-            if project_result.candidates and project_result.project is None:
-                rows = [
-                    [{"text": item.slug[:32], "callback_data": f"project:select:{item.slug}"}]
-                    for item in project_result.candidates[:6]
-                ]
-                self.send(
-                    chat_id,
-                    "Нашёл несколько похожих проектов. Выбери проект.",
-                    reply_markup={"inline_keyboard": rows},
-                )
-                return True
-            project = project_result.project
-            if project is None:
-                self.send(chat_id, "Сначала выберите проект.", reply_markup=project_keyboard(list(self.projects), 0))
-                return True
-            self.queue_prompt_draft(
+            self.queue_task_prompt_resolving_project(
                 chat_id,
                 user_id,
-                project,
                 intent.task_text or original_text,
                 action="new_task",
                 source="text",
@@ -2350,14 +2457,9 @@ class CodexTelegramBot:
             return
 
         if state.pending_action in {"new_task", "direct_task"}:
-            project = self.current_project(chat_id)
-            if project is None:
-                self.send(chat_id, "No context selected and root context is missing. Run /refresh.")
-                return
-            self.queue_prompt_draft(
+            self.queue_task_prompt_resolving_project(
                 chat_id,
                 user_id,
-                project,
                 text,
                 action=state.pending_action,
                 source="text",
@@ -2466,20 +2568,20 @@ class CodexTelegramBot:
             return
 
         if state.pending_action == "new_task":
-            self.create_task_for_project(
+            self.queue_task_prompt_resolving_project(
                 chat_id,
                 user_id,
-                project,
                 transcript,
+                action="new_task",
                 source="voice",
                 source_path=str(destination),
             )
         elif state.pending_action == "direct_task":
-            self.create_direct_task_for_project(
+            self.queue_task_prompt_resolving_project(
                 chat_id,
                 user_id,
-                project,
                 transcript,
+                action="direct_task",
                 source="voice",
                 source_path=str(destination),
             )
@@ -3647,50 +3749,136 @@ class CodexTelegramBot:
             self.store.save_chat_state(state)
         self.send(chat_id, f"Task {task.id} canceled.")
 
+    def project_from_task_record(self, task: TaskRecord) -> ProjectInfo:
+        return ProjectInfo(
+            slug=task.project_slug,
+            name=task.project_name,
+            path=task.project_path,
+            base=str(Path(task.project_path).parent),
+            is_git=is_git_repo(task.project_path),
+            branch=None,
+            origin=None,
+            languages=[],
+            markers=[],
+            docs=[],
+            test_hints=[],
+        )
+
+    def force_push_target_project(self, task: TaskRecord) -> ProjectInfo:
+        primary = self.find_project(task.project_slug)
+        if primary is not None and is_git_repo(primary.path):
+            return primary
+        if is_git_repo(task.project_path):
+            return primary or self.project_from_task_record(task)
+
+        candidates: list[ProjectInfo] = []
+        for slug in task.context_project_slugs:
+            if slug in {ROOT_PROJECT_SLUG, task.project_slug}:
+                continue
+            project = self.find_project(slug)
+            if (
+                project is not None
+                and project.slug not in {item.slug for item in candidates}
+                and is_git_repo(project.path)
+            ):
+                candidates.append(project)
+
+        if len(candidates) == 1:
+            return candidates[0]
+        return primary or self.project_from_task_record(task)
+
     def force_push_task(self, chat_id: int, task_id: str) -> None:
         task = self.recent_context_task(chat_id, task_id, phases={"completed"})
         if task is None:
             self.send(chat_id, "Task not found or not completed.", reply_markup=tasks_keyboard())
             return
 
-        result = force_push_current_branch(task.project_path)
-        sanitized_error = self.redactor.redact_text(result.error, max_chars=500).text
-        sanitized_output = self.redactor.redact_text(result.output, max_chars=2500).text
-        if result.ok:
-            self.append_event(
-                task.id,
-                "safety",
-                "System",
-                f"Force push completed for branch {result.branch}.",
-                {"branch": result.branch, "upstream": result.upstream},
-            )
-            lines = [
-                f"Force push completed for {task.id}.",
-                f"Branch: {result.branch}",
-                f"Upstream: {result.upstream}",
-                f"Command: {result.command}",
-            ]
-            details = sanitized_output
+        project = self.force_push_target_project(task)
+        force_task = self.store.create_task(
+            chat_id=chat_id,
+            user_id=task.user_id,
+            project_slug=project.slug,
+            project_name=project.name,
+            project_path=project.path,
+            prompt=(
+                f"Force push the current task branch for completed Telegram task {task.id}. "
+                "Use git push --force-with-lease only after verifying branch and upstream."
+            ),
+            context_project_slugs=normalize_context_project_slugs(
+                project.slug,
+                task.context_project_slugs,
+            ),
+            kind="force_push_task",
+            source="button",
+            source_path="",
+            parent_task_id=task.id,
+        )
+        self.append_event(
+            task.id,
+            "safety",
+            "System",
+            f"Force push agent launched as task {force_task.id}.",
+            {"force_push_task_id": force_task.id, "project_path": force_task.project_path},
+        )
+        self.append_event(
+            force_task.id,
+            "state_change",
+            "PM",
+            f"Force push requested from completed task {task.id}.",
+            {"parent_task_id": task.id},
+        )
+        state = self.store.load_chat_state(chat_id)
+        state.last_task_id = force_task.id
+        self.store.save_chat_state(state)
+        status_message_id = self.send_codex_status(
+            force_task,
+            "running",
+            (
+                f"Force push task {force_task.id} created from {task.id}. "
+                "Запускаю Codex с правами danger-full-access."
+            ),
+            reply_markup=running_task_keyboard(force_task.id),
+        )
+        self.spawn(self.execute_force_push_task, force_task.id, status_message_id)
+
+    def execute_force_push_task(
+        self,
+        task_id: str,
+        status_message_id: int | None = None,
+    ) -> None:
+        task = self.store.load_task(task_id)
+        if task is None:
+            return
+        parent = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
+        project = self.find_project(task.project_slug) or self.project_from_task_record(task)
+
+        log_path = self.store.task_dir(task.id) / "force-push.log"
+        self.append_event(task.id, "state_change", "CodexDev", "Force push agent started.")
+        status = self.start_codex_status(
+            task,
+            "running",
+            log_path,
+            message_id=status_message_id,
+        )
+        task = self.runner.run_force_push_agent(task, project, parent)
+        self.remember_task_context(task, "status")
+        self.finish_codex_status(status, task)
+        final = read_task_final(task)
+        parent_task_id = parent.id if parent is not None else task.id
+
+        if task.phase == "completed":
+            self.append_event(task.id, "state_change", "System", "Force push agent completed.")
+            message = f"Force push task {task.id} completed.\n\n{final or 'Final response is empty.'}"
+            reply_markup = completed_task_keyboard(parent_task_id)
         else:
-            self.append_event(
-                task.id,
-                "safety",
-                "System",
-                f"Force push failed or blocked: {sanitized_error or 'unknown error'}",
-                {"branch": result.branch, "upstream": result.upstream},
+            self.append_event(task.id, "state_change", "System", f"Force push agent failed: {task.error}")
+            log_tail = tail_file(task.run_log_path, max_lines=60)
+            message = (
+                f"Force push task {task.id} failed: {task.error}\n\n"
+                f"Final:\n{final or '-'}\n\nLog tail:\n{log_tail}"
             )
-            lines = [
-                f"Force push failed for {task.id}.",
-                f"Branch: {result.branch or '-'}",
-                f"Upstream: {result.upstream or '-'}",
-                f"Reason: {sanitized_error or '-'}",
-            ]
-            if result.command:
-                lines.append(f"Command: {result.command}")
-            details = sanitized_output
-        if details:
-            lines.extend(["", details])
-        self.send(chat_id, "\n".join(lines)[:4000], reply_markup=completed_task_keyboard(task.id))
+            reply_markup = failed_task_keyboard(task.id)
+        self.send(task.chat_id, message, reply_markup=reply_markup)
 
     def handle_task_callback(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,7 @@ import codex_telegram_bot.bot as bot_module
 from codex_telegram_bot.bot import (
     BOT_COMMANDS,
     CodexTelegramBot,
+    PROJECT_CHOICE_TTL_SECONDS,
     PROJECT_PAGE_SIZE,
     command_parts,
     completed_task_keyboard,
@@ -21,7 +23,6 @@ from codex_telegram_bot.bot import (
 )
 from codex_telegram_bot.config import Config
 from codex_telegram_bot.project_index import ProjectInfo
-from codex_telegram_bot.services.git_safety import GitForcePushResult
 from codex_telegram_bot.task_store import TaskRecord
 
 
@@ -1025,6 +1026,129 @@ class BotUiTest(unittest.TestCase):
         self.assertIn(f"task:brain:{tasks[0].id}", callbacks)
         self.assertIn(f"task:plan:{tasks[0].id}", callbacks)
 
+    def test_pending_task_text_resolves_target_slug_instead_of_root_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project("root"), demo_project("metrics-etl-php")]
+            sent: list[tuple[str, dict | None]] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or len(sent)
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "root"
+            state.active_project_slugs = ["root"]
+            state.pending_action = "new_task"
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(
+                10,
+                20,
+                "перезапустить agent-sdlc. Правильный slug - metrics-etl-php",
+            )
+            bot.flush_prompt_draft(10)
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].project_slug, "metrics-etl-php")
+        self.assertEqual(spawned[0][0].__name__, "plan_task")
+
+    def test_pending_task_text_asks_for_project_when_root_context_is_unclear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project("root"), demo_project("metrics-etl-php")]
+            sent: list[tuple[str, dict | None]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or len(sent)
+            bot.spawn = lambda target, *args: None
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "root"
+            state.active_project_slugs = ["root"]
+            state.pending_action = "new_task"
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "восстановить работу задачи BLA-447")
+
+            pending_tasks = bot.store.recent_tasks(10, limit=10)
+            clarification = sent[-1]
+
+            # Answering the clarification must resume the stored task text.
+            bot.select_project_by_record(10, demo_project("metrics-etl-php"))
+            bot.flush_prompt_draft(10)
+            tasks = bot.store.recent_tasks(10, limit=10)
+
+        self.assertEqual(pending_tasks, [])
+        self.assertIn("Не понял, в каком проекте будут изменения", clarification[0])
+        self.assertEqual(
+            [row[0]["callback_data"] for row in clarification[1]["inline_keyboard"][:2]],
+            ["proj:0", "proj:1"],
+        )
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].project_slug, "metrics-etl-php")
+        self.assertEqual(tasks[0].prompt, "восстановить работу задачи BLA-447")
+
+    def test_ambiguous_project_tokens_offer_candidates_and_resume_task(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [
+                demo_project("root"),
+                demo_project("metrics-etl-php"),
+                demo_project("metrics-api"),
+            ]
+            sent: list[tuple[str, dict | None]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append((text, reply_markup)) or len(sent)
+            bot.spawn = lambda target, *args: None
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "root"
+            state.active_project_slugs = ["root"]
+            state.pending_action = "new_task"
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "почини metrics")
+
+            clarification = sent[-1]
+            bot.select_project_by_record(10, demo_project("metrics-api"))
+            bot.flush_prompt_draft(10)
+            tasks = bot.store.recent_tasks(10, limit=10)
+
+        self.assertIn("Нужно уточнить проект", clarification[0])
+        self.assertEqual(
+            [row[0]["callback_data"] for row in clarification[1]["inline_keyboard"]],
+            ["project:select:metrics-etl-php", "project:select:metrics-api"],
+        )
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(tasks[0].project_slug, "metrics-api")
+        self.assertEqual(tasks[0].prompt, "почини metrics")
+
+    def test_stale_project_choice_is_not_resumed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project("root"), demo_project("metrics-etl-php")]
+            bot.send = lambda chat_id, text, reply_markup=None: 1
+            bot.spawn = lambda target, *args: None
+            state = bot.store.load_chat_state(10)
+            state.selected_project_slug = "root"
+            state.active_project_slugs = ["root"]
+            state.pending_action = "new_task"
+            bot.store.save_chat_state(state)
+
+            bot.handle_plain_text(10, 20, "восстановить работу задачи BLA-447")
+
+            state = bot.store.load_chat_state(10)
+            state.pending_project_choice_at -= PROJECT_CHOICE_TTL_SECONDS + 1
+            bot.store.save_chat_state(state)
+
+            bot.select_project_by_record(10, demo_project("metrics-etl-php"))
+            bot.flush_prompt_draft(10)
+            tasks = bot.store.recent_tasks(10, limit=10)
+            cleared = bot.store.load_chat_state(10)
+
+        self.assertEqual(tasks, [])
+        self.assertEqual(cleared.pending_project_choice_text, "")
+
     def test_brain_callback_shows_task_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(tmp)
@@ -1045,37 +1169,83 @@ class BotUiTest(unittest.TestCase):
         self.assertIn("Мозги команды", bot.api.sent[-1][1])
         self.assertIn("PM: Принял задачу", bot.api.sent[-1][1])
 
-    def test_force_push_callback_runs_completed_task_action(self) -> None:
+    def test_force_push_callback_launches_agent_in_context_repo_from_root_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(tmp)
             bot = CodexTelegramBot(config)
             bot.api = FakeTelegramAPI()
-            task = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "do work")
+            root = Path(tmp)
+            repo = root / "repo"
+            repo.mkdir()
+            subprocess.run(
+                ["git", "init"],
+                cwd=repo,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            bot.projects = [
+                ProjectInfo(
+                    slug="root",
+                    name="workspace-root",
+                    path=str(root),
+                    base=str(root),
+                    is_git=False,
+                    branch=None,
+                    origin=None,
+                    languages=[],
+                    markers=[],
+                    docs=[],
+                    test_hints=[],
+                ),
+                ProjectInfo(
+                    slug="demo",
+                    name="demo",
+                    path=str(repo),
+                    base=str(root),
+                    is_git=True,
+                    branch="feature/demo",
+                    origin=None,
+                    languages=[],
+                    markers=[],
+                    docs=[],
+                    test_hints=[],
+                ),
+            ]
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            task = bot.store.create_task(
+                10,
+                20,
+                "root",
+                "workspace-root",
+                str(root),
+                "do work in repo",
+                context_project_slugs=["root", "demo"],
+            )
             task.phase = "completed"
             bot.store.save_task(task)
 
-            original_force_push = bot_module.force_push_current_branch
-            bot_module.force_push_current_branch = lambda _path: GitForcePushResult(
-                ok=True,
-                branch="feature/demo",
-                upstream="origin/feature/demo",
-                command="git push --force-with-lease origin HEAD:feature/demo",
-                output="forced update",
+            bot.handle_callback(
+                {
+                    "id": "callback-1",
+                    "data": f"task:force_push:{task.id}",
+                    "message": {"message_id": 42, "chat": {"id": 10}},
+                    "from": {"id": 20},
+                }
             )
-            try:
-                bot.handle_callback(
-                    {
-                        "id": "callback-1",
-                        "data": f"task:force_push:{task.id}",
-                        "message": {"message_id": 42, "chat": {"id": 10}},
-                        "from": {"id": 20},
-                    }
-                )
-            finally:
-                bot_module.force_push_current_branch = original_force_push
 
-        self.assertIn("Force push completed", bot.api.sent[-1][1])
-        self.assertIn("feature/demo", bot.api.sent[-1][1])
+            force_task_id = spawned[0][1][0]
+            force_task = bot.store.load_task(force_task_id)
+
+        self.assertEqual(spawned[0][0].__name__, "execute_force_push_task")
+        self.assertIsNotNone(force_task)
+        self.assertEqual(force_task.parent_task_id, task.id)
+        self.assertEqual(force_task.kind, "force_push_task")
+        self.assertEqual(force_task.project_slug, "demo")
+        self.assertEqual(force_task.project_path, str(repo))
+        self.assertIn("--force-with-lease", force_task.prompt)
 
     def test_plain_text_confirm_executes_last_planned_task(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

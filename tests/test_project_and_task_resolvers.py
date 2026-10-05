@@ -41,6 +41,50 @@ class ProjectAndTaskResolverTest(unittest.TestCase):
         self.assertEqual(result.project.slug, "billing-api")
         self.assertGreater(result.confidence, 0.8)
 
+    def test_project_resolver_uses_explicit_slug_hint_over_other_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            aliases = ProjectAliasStore(Path(tmp) / "index")
+            resolver = ProjectResolver(aliases)
+            result = resolver.resolve(
+                "перезапустить agent-sdlc. Правильный slug - metrics-etl-php",
+                [project("root"), project("agent-sdlc"), project("metrics-etl-php")],
+                default_project=project("root"),
+            )
+
+        self.assertIsNotNone(result.project)
+        self.assertEqual(result.project.slug, "metrics-etl-php")
+
+    def test_project_resolver_asks_when_root_context_has_no_project_signal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            aliases = ProjectAliasStore(Path(tmp) / "index")
+            resolver = ProjectResolver(aliases)
+            result = resolver.resolve(
+                "восстановить работу задачи BLA-447",
+                [project("root"), project("metrics-etl-php"), project("agent-sdlc")],
+                default_project=project("root"),
+            )
+
+        self.assertIsNone(result.project)
+        self.assertEqual(
+            [candidate.slug for candidate in result.candidates],
+            ["metrics-etl-php", "agent-sdlc"],
+        )
+
+    def test_project_resolver_reports_ambiguous_project_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            aliases = ProjectAliasStore(Path(tmp) / "index")
+            resolver = ProjectResolver(aliases)
+            result = resolver.resolve(
+                "проверь metrics",
+                [project("metrics-etl-php"), project("metrics-api")],
+            )
+
+        self.assertIsNone(result.project)
+        self.assertEqual(
+            [candidate.slug for candidate in result.candidates],
+            ["metrics-etl-php", "metrics-api"],
+        )
+
     def test_task_resolver_finds_continue_query(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = TaskStore(Path(tmp))

@@ -344,6 +344,54 @@ Treat attached files as user-provided local inputs. Use their paths only when ne
 """
 
 
+def force_push_prompt(
+    task: TaskRecord,
+    context: str,
+    parent_task: TaskRecord | None,
+) -> str:
+    parent_id = parent_task.id if parent_task is not None else task.parent_task_id or "-"
+    parent_project = (
+        f"{parent_task.project_name} ({parent_task.project_path})"
+        if parent_task is not None
+        else "-"
+    )
+    parent_log_path = parent_task.run_log_path if parent_task is not None else ""
+    parent_final_path = parent_task.final_path if parent_task is not None else ""
+    return f"""This Telegram action was explicitly triggered by the completed task's Force push button.
+
+Execute only the force-push action needed for the completed task. Do not edit files. Do not commit.
+Use `git push --force-with-lease`, not plain `--force`.
+Before pushing, inspect the current branch and upstream. Do not force-push protected branches `main` or `master`.
+If the target repository is ambiguous, stop and explain the ambiguity instead of guessing.
+The user communicates in Russian; final answer must be in Russian and use:
+
+- Changed:
+- Why:
+- Verified:
+- Risks / Notes:
+
+Force push task:
+- id: {task.id}
+- project name: {task.project_name}
+- project path: {task.project_path}
+- project slug: {task.project_slug}
+
+Parent completed task:
+- id: {parent_id}
+- project: {parent_project}
+- run log path: {parent_log_path or "-"}
+- final answer path: {parent_final_path or "-"}
+
+If `project path` is not a git repository, use the parent task artifacts above and the project context below to find the repository changed by the completed task.
+
+Project agent context:
+{context}
+
+Original force-push instruction:
+{task.prompt}
+"""
+
+
 def agent_chat_prompt(task: TaskRecord, context: str) -> str:
     return f"""You are Codex running as a read-only AI agent for a Telegram chat.
 
@@ -442,6 +490,16 @@ class CodexRunner:
         if selected_model:
             command.extend(["-m", selected_model])
         command.extend([session_id, "-"])
+        return command
+
+    def _force_push_command(
+        self,
+        project_path: str,
+        output_path: Path,
+        model: str | None = None,
+    ) -> list[str]:
+        command = self._base_command(project_path, output_path, model=model)
+        command.extend(["--dangerously-bypass-approvals-and-sandbox", "--ignore-rules", "-"])
         return command
 
     def _mark_process_started(
@@ -726,6 +784,63 @@ class CodexRunner:
                     task.error = f"Continuation failed with exit code {returncode}."
 
         task.codex_session_id = extract_session_id(log_path) or resume_session_id
+        self._mark_process_finished(task)
+        return task
+
+    def run_force_push_agent(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        parent_task: TaskRecord | None,
+        model: str | None = None,
+    ) -> TaskRecord:
+        task.phase = "running"
+        task.returncode = None
+        task.error = ""
+        task.executor_provider = "codex"
+        task_dir = self.store.task_dir(task.id)
+        final_path = task_dir / "force-push-final.md"
+        log_path = task_dir / "force-push.log"
+        prompt_path = task_dir / "force-push-prompt.md"
+        task.final_path = str(final_path)
+        task.run_log_path = str(log_path)
+        task.prompt_path = str(prompt_path)
+        self.store.save_task(task)
+
+        context = read_task_context(self.config.index_dir, task, project)
+        prompt_path.write_text(
+            force_push_prompt(task, context, parent_task),
+            encoding="utf-8",
+        )
+
+        command = self._force_push_command(task.project_path, final_path, model=model)
+
+        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
+            process = subprocess.Popen(
+                command,
+                stdin=stdin,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                cwd=task.project_path,
+                start_new_session=True,
+                env=self._command_env(),
+            )
+            self._mark_process_started(task, process)
+            try:
+                returncode = process.wait(timeout=self.config.run_timeout_seconds)
+            except subprocess.TimeoutExpired:
+                returncode = wait_after_stop(process)
+                task.phase = "failed"
+                task.error = "Force push agent timed out."
+            else:
+                task.returncode = returncode
+                if returncode == 0:
+                    task.phase = "completed"
+                else:
+                    task.phase = "failed"
+                    task.error = f"Force push agent failed with exit code {returncode}."
+
+        task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
         self._mark_process_finished(task)
         return task
 

@@ -108,6 +108,13 @@ class ChatState:
     pending_memory_text: str = ""
     pending_alias_name: str = ""
     pending_alias_project_slug: str = ""
+    pending_project_choice_action: str = ""
+    pending_project_choice_user_id: int | None = None
+    pending_project_choice_text: str = ""
+    pending_project_choice_source: str = "text"
+    pending_project_choice_source_path: str = ""
+    pending_project_choice_manual_tier: str = "auto"
+    pending_project_choice_at: float = 0.0
     updated_at: str = field(default_factory=now_iso)
 
     @classmethod

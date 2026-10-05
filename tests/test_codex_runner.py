@@ -10,6 +10,7 @@ from codex_telegram_bot.codex_runner import (
     continuation_prompt,
     execution_prompt,
     extract_session_id,
+    force_push_prompt,
     interrupted_execution_prompt,
     planning_prompt,
     read_task_context,
@@ -179,6 +180,33 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn("gpt-test", command)
         self.assertEqual(command[-2:], ["019e7842-d41f-72b3-9394-911a9c490cb4", "-"])
 
+    def test_force_push_command_bypasses_approval_policy_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Config(
+                bot_token="token",
+                allowed_chat_ids={1},
+                allowed_user_ids=set(),
+                project_roots=[],
+                index_dir=Path(tmp) / "index",
+                state_dir=Path(tmp) / "state",
+                codex_bin="codex",
+                model=None,
+                poll_timeout_seconds=30,
+                prompt_debounce_seconds=60,
+                plan_timeout_seconds=60,
+                run_timeout_seconds=None,
+                transcribe_command=None,
+                transcribe_timeout_seconds=300,
+                env_file=Path(tmp) / "telegram.env",
+            )
+            runner = CodexRunner(config, TaskStore(config.state_dir))
+
+            command = runner._force_push_command("/tmp/demo", Path(tmp) / "out.md")
+
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
+        self.assertIn("--ignore-rules", command)
+        self.assertEqual(command[-1], "-")
+
     def test_claude_execution_writes_stdout_to_final(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             project_dir = Path(tmp) / "project"
@@ -264,6 +292,106 @@ class CodexRunnerTest(unittest.TestCase):
         self.assertIn("Parent task:", prompt)
         self.assertIn("initial task", prompt)
         self.assertIn("continue with tests", prompt)
+
+    def test_force_push_prompt_requires_safe_explicit_push(self) -> None:
+        parent = TaskRecord(
+            id="parent-1",
+            chat_id=10,
+            user_id=20,
+            project_slug="root",
+            project_name="workspace-root",
+            project_path="/home/stanislavv",
+            prompt="finish task",
+            run_log_path="/tmp/task/run.log",
+            final_path="/tmp/task/final.md",
+        )
+        task = TaskRecord(
+            id="force-1",
+            chat_id=10,
+            user_id=20,
+            project_slug="demo",
+            project_name="demo",
+            project_path="/tmp/demo",
+            prompt="force push parent branch",
+            kind="force_push_task",
+            parent_task_id=parent.id,
+        )
+
+        prompt = force_push_prompt(task, "Demo context", parent)
+
+        self.assertIn("Force push button", prompt)
+        self.assertIn("git push --force-with-lease", prompt)
+        self.assertIn("Do not force-push protected branches `main` or `master`", prompt)
+        self.assertIn("/tmp/task/run.log", prompt)
+
+    def test_force_push_agent_command_bypasses_approval_policy_rules(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_dir = root / "project"
+            project_dir.mkdir()
+            args_path = root / "codex-args.txt"
+            codex_bin = root / "codex"
+            codex_bin.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib\n"
+                "import sys\n"
+                f"pathlib.Path({str(args_path)!r}).write_text('\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+                "sys.stdin.read()\n",
+                encoding="utf-8",
+            )
+            codex_bin.chmod(0o755)
+            config = Config(
+                bot_token="token",
+                allowed_chat_ids={1},
+                allowed_user_ids=set(),
+                project_roots=[],
+                index_dir=root / "index",
+                state_dir=root / "state",
+                codex_bin=str(codex_bin),
+                model=None,
+                poll_timeout_seconds=30,
+                prompt_debounce_seconds=60,
+                plan_timeout_seconds=60,
+                run_timeout_seconds=30,
+                transcribe_command=None,
+                transcribe_timeout_seconds=300,
+                env_file=root / "telegram.env",
+            )
+            runner = CodexRunner(config, TaskStore(config.state_dir))
+            project = ProjectInfo(
+                slug="demo",
+                name="demo",
+                path=str(project_dir),
+                base=str(root),
+                is_git=True,
+                branch="feature/demo",
+                origin=None,
+                languages=[],
+                markers=[],
+                docs=[],
+                test_hints=[],
+            )
+            task = TaskRecord(
+                id="force-1",
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path=str(project_dir),
+                prompt="force push",
+                kind="force_push_task",
+                parent_task_id="parent-1",
+            )
+            runner.store.save_task(task)
+
+            result = runner.run_force_push_agent(task, project, None)
+            args = args_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertEqual(result.phase, "completed")
+        self.assertIn('approval_policy="never"', args)
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", args)
+        self.assertIn("--ignore-rules", args)
+        self.assertEqual(args[-1], "-")
 
     def test_interrupted_execution_prompt_includes_recovery_context(self) -> None:
         task = TaskRecord(
