@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_telegram_bot.config import (
+    DEFAULT_TASK_PROVIDER,
     Config,
     load_env_file,
     parse_bool,
@@ -59,7 +60,9 @@ EMPTY=
 
     def test_normalize_task_provider(self) -> None:
         self.assertEqual(normalize_task_provider("Claude"), "claude")
-        self.assertEqual(normalize_task_provider(None), "codex")
+        self.assertEqual(normalize_task_provider("Codex"), "codex")
+        self.assertEqual(normalize_task_provider(None), DEFAULT_TASK_PROVIDER)
+        self.assertEqual(normalize_task_provider(None, "codex"), "codex")
         with self.assertRaisesRegex(ValueError, "Invalid task provider"):
             normalize_task_provider("unknown")
 

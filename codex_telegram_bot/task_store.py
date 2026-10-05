@@ -34,7 +34,10 @@ class TaskRecord:
     source: str = "text"
     source_path: str = ""
     parent_task_id: str = ""
+    # Codex session id. Kept under the historical name so existing task records
+    # stay readable; use session_id_for()/set_session_id() for provider-aware access.
     codex_session_id: str = ""
+    claude_session_id: str = ""
     phase: str = "created"
     clarifications: list[str] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
@@ -75,6 +78,19 @@ class TaskRecord:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+    def session_id_for(self, provider: str) -> str:
+        if provider == "claude":
+            return self.claude_session_id
+        return self.codex_session_id
+
+    def set_session_id(self, provider: str, value: str) -> None:
+        if not value:
+            return
+        if provider == "claude":
+            self.claude_session_id = value
+        else:
+            self.codex_session_id = value
 
 
 @dataclass

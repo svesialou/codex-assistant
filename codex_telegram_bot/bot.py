@@ -43,6 +43,7 @@ from .services.git_safety import (
     snapshot_summary,
     write_git_snapshot,
 )
+from .services.executors import executor_agent_name, executor_display_name
 from .services.intent_router import IntentContext, IntentResult, IntentRouter
 from .services.llm_provider import ClaudeProvider
 from .services.model_router import ModelRouter, normalize_manual_tier, render_routing_decision
@@ -876,6 +877,10 @@ class CodexTelegramBot:
         state = self.store.load_chat_state(chat_id)
         return normalize_task_provider(state.task_provider or self.config.task_provider)
 
+    def provider_status_text(self, provider: str) -> str:
+        reason = self.runner.provider_unavailable_reason(provider)
+        return reason or "ready"
+
     def task_context_project_slugs(
         self,
         chat_id: int,
@@ -1371,7 +1376,8 @@ class CodexTelegramBot:
                     f"Debate: {'ON' if self.config.orchestrator_debate else 'OFF'}",
                     f"Fallback to Codex: {'ON' if self.config.orchestrator_fallback_to_codex else 'OFF'}",
                     f"Task provider: {task_provider}",
-                    f"Claude executor: {'configured' if self.config.claude_executor_command else 'not configured'}",
+                    f"Codex executor: {self.provider_status_text('codex')}",
+                    f"Claude executor: {self.provider_status_text('claude')}",
                     f"Memory: {'ON' if memory else 'OFF'}",
                     f"Debug: {'ON' if state.debug_mode else 'OFF'}",
                 ]
@@ -3184,6 +3190,7 @@ class CodexTelegramBot:
             self.send(task.chat_id, f"Agent failed: {task.error}")
             return
 
+        provider = self.effective_task_provider(task.chat_id)
         log_path = self.store.task_dir(task.id) / "agent.log"
         self.append_event(task.id, "state_change", "Architect", "Read-only agent chat started.")
         status = self.start_codex_status(
@@ -3192,7 +3199,7 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_agent_chat(task, project)
+        task = self.runner.run_agent_chat(task, project, provider=provider)
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
@@ -3359,7 +3366,7 @@ class CodexTelegramBot:
         self.store.save_chat_state(state)
         provider = self.effective_task_provider(chat_id)
         if self.effective_orchestrator_mode(chat_id):
-            executor_name = "Claude" if provider == "claude" else "Codex"
+            executor_name = executor_display_name(provider)
             activity = (
                 "Orchestrator mode включён.\n\n"
                 "1. ModelRouter выберет минимально достаточный tier.\n"
@@ -3456,6 +3463,7 @@ class CodexTelegramBot:
             self.send(task.chat_id, f"Task {task.id} failed: {task.error}")
             return
 
+        provider = self.effective_task_provider(task.chat_id)
         log_path = self.store.task_dir(task.id) / "plan.log"
         self.append_event(task.id, "state_change", "Architect", "Запущено read-only planning.")
         self.remember_task_context(task, "status")
@@ -3465,12 +3473,17 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_planning(task, project)
+        task = self.runner.run_planning(task, project, provider=provider)
         self.remember_task_context(task, "plan" if task.phase == "planned" else "status")
         self.finish_codex_status(status, task)
         if task.phase == "planned":
             self.append_event(task.id, "state_change", "Architect", "Planning completed.")
-            self.append_event(task.id, "agent_message", "CodexDev", "Ожидаю подтверждения выполнения.")
+            self.append_event(
+                task.id,
+                "agent_message",
+                executor_agent_name(provider),
+                "Ожидаю подтверждения выполнения.",
+            )
             self.send(
                 task.chat_id,
                 f"Plan for task {task.id}:\n\n{task.plan_text}",
@@ -3547,7 +3560,7 @@ class CodexTelegramBot:
             state.pending_action = None
             self.store.save_chat_state(state)
         provider = self.effective_task_provider(chat_id)
-        agent_name = "ClaudeDev" if provider == "claude" else "CodexDev"
+        agent_name = executor_agent_name(provider)
         self.append_event(task.id, "state_change", agent_name, "Execution confirmed by user.")
         status_message_id = self.send_codex_status(
             task,
@@ -3580,7 +3593,7 @@ class CodexTelegramBot:
 
         log_path = self.store.task_dir(task.id) / "run.log"
         provider = self.effective_task_provider(task.chat_id)
-        agent_name = "ClaudeDev" if provider == "claude" else "CodexDev"
+        agent_name = executor_agent_name(provider)
         task.executor_provider = provider
         self.store.save_task(task)
         self.append_event(task.id, "state_change", agent_name, "Execution started.")
@@ -3678,8 +3691,14 @@ class CodexTelegramBot:
             self.send(task.chat_id, f"Task {task.id} failed: {task.error}")
             return
 
+        provider = self.effective_task_provider(task.chat_id)
         log_path = self.store.task_dir(task.id) / "run.log"
-        self.append_event(task.id, "state_change", "CodexDev", "Continuation execution started.")
+        self.append_event(
+            task.id,
+            "state_change",
+            executor_agent_name(provider),
+            "Continuation execution started.",
+        )
         pre_snapshot = self.record_git_safety_snapshot(task, "pre-execution")
         if pre_snapshot.is_dirty:
             self.send(
@@ -3693,7 +3712,7 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_followup_execution(task, project)
+        task = self.runner.run_followup_execution(task, project, provider=provider)
         post_snapshot = self.record_git_safety_snapshot(task, "post-execution")
         if self.effective_memory_mode(task.chat_id):
             self.memory_engine.remember_completed_task(
@@ -3835,7 +3854,8 @@ class CodexTelegramBot:
             "running",
             (
                 f"Force push task {force_task.id} created from {task.id}. "
-                "Запускаю Codex с правами danger-full-access."
+                f"Запускаю {executor_display_name(self.effective_task_provider(chat_id))} "
+                "с правами danger-full-access."
             ),
             reply_markup=running_task_keyboard(force_task.id),
         )
@@ -3852,15 +3872,21 @@ class CodexTelegramBot:
         parent = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
         project = self.find_project(task.project_slug) or self.project_from_task_record(task)
 
+        provider = self.effective_task_provider(task.chat_id)
         log_path = self.store.task_dir(task.id) / "force-push.log"
-        self.append_event(task.id, "state_change", "CodexDev", "Force push agent started.")
+        self.append_event(
+            task.id,
+            "state_change",
+            executor_agent_name(provider),
+            "Force push agent started.",
+        )
         status = self.start_codex_status(
             task,
             "running",
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_force_push_agent(task, project, parent)
+        task = self.runner.run_force_push_agent(task, project, parent, provider=provider)
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = read_task_final(task)

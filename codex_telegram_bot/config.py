@@ -115,9 +115,23 @@ def normalize_tier(value: str | None, default: str = "auto") -> str:
     return tier
 
 
-def normalize_task_provider(value: str | None, default: str = "codex") -> str:
+TASK_PROVIDERS = ("codex", "claude")
+DEFAULT_TASK_PROVIDER = "claude"
+DEFAULT_CLAUDE_EXEC_COMMAND = (
+    "claude -p --output-format text --permission-mode bypassPermissions"
+)
+# Planning and agent chat must not touch the workspace.
+DEFAULT_CLAUDE_READONLY_COMMAND = (
+    "claude -p --output-format text --permission-mode plan"
+)
+
+
+def normalize_task_provider(
+    value: str | None,
+    default: str = DEFAULT_TASK_PROVIDER,
+) -> str:
     provider = (value or default).strip().lower()
-    if provider not in {"codex", "claude"}:
+    if provider not in TASK_PROVIDERS:
         raise ValueError(f"Invalid task provider: {value}")
     return provider
 
@@ -218,12 +232,12 @@ class Config:
     orchestrator_default_tier: str = "cheap"
     orchestrator_max_auto_tier: str = "strong"
     orchestrator_require_confirm_for_max: bool = True
-    task_provider: str = "codex"
+    task_provider: str = DEFAULT_TASK_PROVIDER
     claude_enabled: bool = True
     claude_command: str | None = None
-    claude_executor_command: str = (
-        "claude -p --output-format text --permission-mode bypassPermissions"
-    )
+    claude_executor_command: str = DEFAULT_CLAUDE_EXEC_COMMAND
+    claude_readonly_command: str = DEFAULT_CLAUDE_READONLY_COMMAND
+    claude_resume_enabled: bool = True
     claude_timeout_seconds: int = 300
     claude_max_tokens: int = 8000
     memory_enabled: bool = True
@@ -385,7 +399,7 @@ class Config:
             task_provider=normalize_task_provider(
                 env.get("CODEX_TELEGRAM_TASK_PROVIDER")
                 or env.get("CODEX_TASK_PROVIDER"),
-                "codex",
+                DEFAULT_TASK_PROVIDER,
             ),
             claude_enabled=parse_bool(env.get("CODEX_CLAUDE_ENABLED"), True),
             claude_command=(
@@ -397,7 +411,16 @@ class Config:
             claude_executor_command=(
                 env.get("CODEX_CLAUDE_EXEC_CMD")
                 or env.get("CODEX_TELEGRAM_CLAUDE_EXEC_CMD")
-                or "claude -p --output-format text --permission-mode bypassPermissions"
+                or DEFAULT_CLAUDE_EXEC_COMMAND
+            ),
+            claude_readonly_command=(
+                env.get("CODEX_CLAUDE_READONLY_CMD")
+                or env.get("CODEX_TELEGRAM_CLAUDE_READONLY_CMD")
+                or DEFAULT_CLAUDE_READONLY_COMMAND
+            ),
+            claude_resume_enabled=parse_bool(
+                env.get("CODEX_CLAUDE_RESUME_ENABLED"),
+                True,
             ),
             claude_timeout_seconds=max(
                 1,

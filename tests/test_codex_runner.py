@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from codex_telegram_bot.codex_runner import (
@@ -18,6 +19,12 @@ from codex_telegram_bot.codex_runner import (
 )
 from codex_telegram_bot.config import Config
 from codex_telegram_bot.project_index import ProjectInfo
+from codex_telegram_bot.services.executors import (
+    MODE_EXECUTE,
+    MODE_FORCE_PUSH,
+    MODE_RESUME,
+    build_executors,
+)
 from codex_telegram_bot.task_store import TaskRecord, TaskStore
 
 
@@ -43,12 +50,18 @@ class CodexRunnerTest(unittest.TestCase):
             )
             runner = CodexRunner(config, TaskStore(config.state_dir))
 
-            command = runner._base_command("/home/stanislavv", Path(tmp) / "out.md")
-            env = runner._command_env()
+            command = runner.executor_for("codex").build(
+                MODE_EXECUTE,
+                project_path="/home/stanislavv",
+                output_path=Path(tmp) / "out.md",
+            )
+            env = runner._command_env("codex")
 
-        self.assertNotIn("-a", command)
-        self.assertIn("--skip-git-repo-check", command)
-        self.assertIn('approval_policy="never"', command)
+        self.assertNotIn("-a", command.argv)
+        self.assertIn("--skip-git-repo-check", command.argv)
+        self.assertIn('approval_policy="never"', command.argv)
+        self.assertIn("danger-full-access", command.argv)
+        self.assertFalse(command.final_answer_on_stdout)
         self.assertEqual(env["CODEX_TELEGRAM_SUPPRESS_STOP_HOOK"], "1")
 
     def test_prompts_include_attached_file_paths(self) -> None:
@@ -169,16 +182,21 @@ class CodexRunnerTest(unittest.TestCase):
             )
             runner = CodexRunner(config, TaskStore(config.state_dir))
 
-            command = runner._resume_command(
-                "019e7842-d41f-72b3-9394-911a9c490cb4",
-                Path(tmp) / "out.md",
+            command = runner.executor_for("codex").build(
+                MODE_RESUME,
+                project_path="/tmp/demo",
+                output_path=Path(tmp) / "out.md",
+                session_id="019e7842-d41f-72b3-9394-911a9c490cb4",
             )
 
-        self.assertEqual(command[:3], ["codex", "exec", "resume"])
-        self.assertIn('approval_policy="never"', command)
-        self.assertIn('sandbox_mode="danger-full-access"', command)
-        self.assertIn("gpt-test", command)
-        self.assertEqual(command[-2:], ["019e7842-d41f-72b3-9394-911a9c490cb4", "-"])
+        self.assertEqual(command.argv[:3], ["codex", "exec", "resume"])
+        self.assertIn('approval_policy="never"', command.argv)
+        self.assertIn('sandbox_mode="danger-full-access"', command.argv)
+        self.assertIn("gpt-test", command.argv)
+        self.assertEqual(
+            command.argv[-2:],
+            ["019e7842-d41f-72b3-9394-911a9c490cb4", "-"],
+        )
 
     def test_force_push_command_bypasses_approval_policy_rules(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -201,11 +219,15 @@ class CodexRunnerTest(unittest.TestCase):
             )
             runner = CodexRunner(config, TaskStore(config.state_dir))
 
-            command = runner._force_push_command("/tmp/demo", Path(tmp) / "out.md")
+            command = runner.executor_for("codex").build(
+                MODE_FORCE_PUSH,
+                project_path="/tmp/demo",
+                output_path=Path(tmp) / "out.md",
+            )
 
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command)
-        self.assertIn("--ignore-rules", command)
-        self.assertEqual(command[-1], "-")
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", command.argv)
+        self.assertIn("--ignore-rules", command.argv)
+        self.assertEqual(command.argv[-1], "-")
 
     def test_claude_execution_writes_stdout_to_final(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -384,7 +406,7 @@ class CodexRunnerTest(unittest.TestCase):
             )
             runner.store.save_task(task)
 
-            result = runner.run_force_push_agent(task, project, None)
+            result = runner.run_force_push_agent(task, project, None, provider="codex")
             args = args_path.read_text(encoding="utf-8").splitlines()
 
         self.assertEqual(result.phase, "completed")
@@ -431,6 +453,182 @@ class CodexRunnerTest(unittest.TestCase):
             tail = read_text_tail(path, max_chars=8)
 
         self.assertEqual(tail, "aaaatail")
+
+
+class ProviderRoutingTest(unittest.TestCase):
+    """Every runner entry point must honour the selected executor provider.
+
+    Regression guard: planning, agent chat, follow-ups and force push used to
+    ignore the provider and always spawn Codex, so picking Claude in Telegram
+    silently kept using a Codex session.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.project_dir = self.root / "project"
+        self.project_dir.mkdir()
+        self.claude_args = self.root / "claude-args.txt"
+        self.codex_marker = self.root / "codex-was-called.txt"
+
+        self.claude_bin = self._write_script(
+            "claude",
+            f"pathlib.Path({str(self.claude_args)!r}).write_text("
+            "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+            "sys.stdin.read()\n"
+            "print('CLAUDE_OUTPUT')\n",
+        )
+        self.codex_bin = self._write_script(
+            "codex",
+            f"pathlib.Path({str(self.codex_marker)!r}).write_text('called', encoding='utf-8')\n"
+            "sys.stdin.read()\n",
+        )
+
+    def _write_script(self, name: str, body: str) -> Path:
+        path = self.root / name
+        path.write_text(
+            "#!/usr/bin/env python3\nimport pathlib\nimport sys\n" + body,
+            encoding="utf-8",
+        )
+        path.chmod(0o755)
+        return path
+
+    def _runner(self) -> CodexRunner:
+        config = Config(
+            bot_token="token",
+            allowed_chat_ids={1},
+            allowed_user_ids=set(),
+            project_roots=[],
+            index_dir=self.root / "index",
+            state_dir=self.root / "state",
+            codex_bin=str(self.codex_bin),
+            model=None,
+            poll_timeout_seconds=30,
+            prompt_debounce_seconds=60,
+            plan_timeout_seconds=30,
+            run_timeout_seconds=30,
+            transcribe_command=None,
+            transcribe_timeout_seconds=300,
+            env_file=self.root / "telegram.env",
+            claude_executor_command=f"{self.claude_bin} -p",
+            claude_readonly_command=f"{self.claude_bin} -p --permission-mode plan",
+        )
+        return CodexRunner(config, TaskStore(config.state_dir))
+
+    def _project(self) -> ProjectInfo:
+        return ProjectInfo(
+            slug="demo",
+            name="demo",
+            path=str(self.project_dir),
+            base=str(self.root),
+            is_git=False,
+            branch=None,
+            origin=None,
+            languages=[],
+            markers=[],
+            docs=[],
+            test_hints=[],
+        )
+
+    def _task(self, runner: CodexRunner, task_id: str, **kwargs: object) -> TaskRecord:
+        task = TaskRecord(
+            id=task_id,
+            chat_id=10,
+            user_id=20,
+            project_slug="demo",
+            project_name="demo",
+            project_path=str(self.project_dir),
+            prompt="do the work",
+            **kwargs,
+        )
+        runner.store.save_task(task)
+        return task
+
+    def _claude_argv(self) -> list[str]:
+        return self.claude_args.read_text(encoding="utf-8").splitlines()
+
+    def test_planning_with_claude_never_spawns_codex(self) -> None:
+        runner = self._runner()
+        task = self._task(runner, "plan-1")
+
+        result = runner.run_planning(task, self._project(), provider="claude")
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(result.phase, "planned")
+        self.assertEqual(result.executor_provider, "claude")
+        self.assertIn("CLAUDE_OUTPUT", result.plan_text)
+        # Planning must stay read-only.
+        self.assertIn("plan", self._claude_argv())
+
+    def test_agent_chat_with_claude_never_spawns_codex(self) -> None:
+        runner = self._runner()
+        task = self._task(runner, "chat-1", kind="agent_chat")
+
+        result = runner.run_agent_chat(task, self._project(), provider="claude")
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(result.phase, "agent_completed")
+        self.assertEqual(result.executor_provider, "claude")
+
+    def test_force_push_with_claude_never_spawns_codex(self) -> None:
+        runner = self._runner()
+        task = self._task(runner, "force-1", kind="force_push_task")
+
+        result = runner.run_force_push_agent(
+            task,
+            self._project(),
+            None,
+            provider="claude",
+        )
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(result.phase, "completed")
+        self.assertEqual(result.executor_provider, "claude")
+
+    def test_claude_execution_records_session_and_followup_resumes_it(self) -> None:
+        runner = self._runner()
+        project = self._project()
+        task = self._task(runner, "task-1")
+
+        executed = runner.run_execution(task, project, provider="claude")
+        session_id = executed.claude_session_id
+
+        self.assertTrue(session_id)
+        self.assertIn("--session-id", self._claude_argv())
+        self.assertEqual(executed.codex_session_id, "")
+
+        followup = runner.run_followup_execution(executed, project, provider="claude")
+        argv = self._claude_argv()
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(followup.phase, "completed")
+        self.assertIn("--resume", argv)
+        self.assertIn(session_id, argv)
+
+    def test_followup_without_session_falls_back_to_fresh_run(self) -> None:
+        runner = self._runner()
+        task = self._task(runner, "followup-1", kind="followup_task", parent_task_id="parent-1")
+
+        result = runner.run_followup_execution(task, self._project(), provider="claude")
+        argv = self._claude_argv()
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(result.phase, "completed")
+        self.assertIn("--session-id", argv)
+        self.assertNotIn("--resume", argv)
+
+    def test_unavailable_provider_fails_with_reason_instead_of_other_provider(self) -> None:
+        runner = self._runner()
+        runner.config = replace(runner.config, claude_enabled=False)
+        runner.executors = build_executors(runner.config)
+        task = self._task(runner, "task-2")
+
+        result = runner.run_execution(task, self._project(), provider="claude")
+
+        self.assertFalse(self.codex_marker.exists())
+        self.assertEqual(result.phase, "failed")
+        self.assertIn("disabled", result.error)
 
 
 if __name__ == "__main__":

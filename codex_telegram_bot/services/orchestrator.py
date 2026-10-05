@@ -10,6 +10,7 @@ from ..codex_runner import CodexRunner, read_task_context
 from ..config import Config
 from ..project_index import ProjectInfo
 from ..task_store import TaskRecord, TaskStore, now_iso
+from .executors import executor_display_name
 from .llm_provider import LlmProvider, LlmProviderUnavailable, LlmRequest
 from .model_router import (
     ModelRouter,
@@ -153,9 +154,19 @@ class OrchestratorService:
             return self._run_executor(task, project, decision, recover=recover)
 
         if not self._executor_available(decision):
-            if self.config.orchestrator_strict_mode or not self.config.orchestrator_fallback_to_codex:
+            selected_name = executor_display_name(decision.executor_provider)
+            reason = self.runner.provider_unavailable_reason(decision.executor_provider)
+            fallback_possible = (
+                decision.executor_provider != "codex"
+                and not self.runner.provider_unavailable_reason("codex")
+            )
+            if (
+                self.config.orchestrator_strict_mode
+                or not self.config.orchestrator_fallback_to_codex
+                or not fallback_possible
+            ):
                 task.phase = "failed"
-                task.error = "Claude executor is unavailable and fallback is disabled."
+                task.error = f"{selected_name} executor is unavailable: {reason}"
                 self.store.save_task(task)
                 self._save_trace(task, decision, final_status="failed")
                 return task
@@ -163,15 +174,18 @@ class OrchestratorService:
                 append_event,
                 task.id,
                 "Orchestrator",
-                "Claude executor unavailable; falling back to Codex executor.",
-                {"fallback_to_codex": True},
+                f"{selected_name} executor unavailable; falling back to Codex executor.",
+                {"fallback_to_codex": True, "reason": reason},
             )
             if notify is not None:
-                notify("Claude executor недоступен. Перехожу на Codex по fallback-настройке.")
+                notify(
+                    f"{selected_name} executor недоступен ({reason}). "
+                    "Перехожу на Codex по fallback-настройке."
+                )
             decision = self._fallback_to_codex_decision(task, decision)
 
         if not decision.classification.requires_architect and not decision.classification.requires_reviewer:
-            executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+            executor_name = executor_display_name(decision.executor_provider)
             self._append_event(
                 append_event,
                 task.id,
@@ -196,7 +210,7 @@ class OrchestratorService:
                 {"executor_provider": decision.executor_provider},
             )
             if notify is not None:
-                executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+                executor_name = executor_display_name(decision.executor_provider)
                 notify(f"Claude architect/reviewer недоступен. Запускаю {executor_name}-only flow.")
             decision = self._without_claude_roles_decision(task, decision)
             task = self._run_executor(task, project, decision, recover=recover)
@@ -249,7 +263,7 @@ class OrchestratorService:
 
         task = self._run_executor(task, project, decision, recover=recover)
         if notify is not None:
-            executor_name = "Claude" if decision.executor_provider == "claude" else "Codex"
+            executor_name = executor_display_name(decision.executor_provider)
             notify(f"{executor_name}: завершил реализацию." if task.phase == "completed" else f"{executor_name}: выполнение завершилось ошибкой.")
         if task.phase != "completed" or not decision.classification.requires_reviewer:
             self._save_trace(
@@ -379,11 +393,7 @@ class OrchestratorService:
         )
 
     def _executor_available(self, decision: RoutingDecision) -> bool:
-        if decision.executor_provider != "claude":
-            return True
-        if not self.config.claude_enabled:
-            return False
-        return bool(self.config.claude_executor_command)
+        return not self.runner.provider_unavailable_reason(decision.executor_provider)
 
     def _claude_orchestrator_available(self, decision: RoutingDecision) -> bool:
         if not (

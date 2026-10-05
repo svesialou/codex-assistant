@@ -10,7 +10,11 @@ from codex_telegram_bot.project_index import ProjectInfo
 from codex_telegram_bot.task_store import TaskRecord, TaskStore
 
 
-def config_for(tmp: str, orchestrator: bool = True) -> Config:
+def config_for(
+    tmp: str,
+    orchestrator: bool = True,
+    task_provider: str = "codex",
+) -> Config:
     return Config(
         bot_token="token",
         allowed_chat_ids={10},
@@ -28,6 +32,7 @@ def config_for(tmp: str, orchestrator: bool = True) -> Config:
         transcribe_timeout_seconds=300,
         env_file=Path(tmp) / "telegram.env",
         orchestrator_default_mode=orchestrator,
+        task_provider=task_provider,
     )
 
 
@@ -48,10 +53,14 @@ def demo_project() -> ProjectInfo:
 
 
 class FakeRunner:
-    def __init__(self, store: TaskStore) -> None:
+    def __init__(self, store: TaskStore, unavailable: dict[str, str] | None = None) -> None:
         self.store = store
         self.calls: list[tuple[str, str | None, str]] = []
         self.runtime_id = "fake"
+        self.unavailable = unavailable or {}
+
+    def provider_unavailable_reason(self, provider: str) -> str:
+        return self.unavailable.get(provider, "")
 
     def run_execution(
         self,
