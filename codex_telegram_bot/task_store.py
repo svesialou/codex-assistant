@@ -164,6 +164,7 @@ class TaskStore:
         source_path: str = "",
         parent_task_id: str = "",
         codex_session_id: str = "",
+        claude_session_id: str = "",
     ) -> TaskRecord:
         task_id = new_task_id()
         task = TaskRecord(
@@ -182,6 +183,7 @@ class TaskStore:
             source_path=source_path,
             parent_task_id=parent_task_id,
             codex_session_id=codex_session_id,
+            claude_session_id=claude_session_id,
         )
         self.save_task(task)
         return task

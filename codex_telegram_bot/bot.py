@@ -100,7 +100,7 @@ Commands:
 /run <text> - execute directly in the selected default project
 /answer <task_id> <text> - add clarification and rerun planning
 /confirm <task_id> - execute a planned task
-/continue <task_id> <text> - continue a completed task in its Codex session
+/continue <task_id> <text> - continue a completed task in its executor session
 /cancel <task_id> - cancel a task or stop a running Codex process
 /status [task_id] - show global active processes or one task
 /processes - show active Codex processes across projects
@@ -979,7 +979,7 @@ class CodexTelegramBot:
             state.last_planned_task_id = task.id
         if task.phase in {"completed", "agent_completed"}:
             state.last_completed_task_id = task.id
-        if task.codex_session_id:
+        if task.codex_session_id or task.claude_session_id:
             state.last_task_with_session_id = task.id
         if view:
             state.last_shown_view = view
@@ -2198,7 +2198,7 @@ class CodexTelegramBot:
                 phases={"completed"},
             )
             if task is None:
-                self.send(chat_id, "Не нашел completed задачу с Codex session для продолжения.", reply_markup=tasks_keyboard())
+                self.send(chat_id, "Не нашёл completed задачу для продолжения.", reply_markup=tasks_keyboard())
                 return True
             self.start_continue_input(chat_id, task.id)
             return True
@@ -2618,13 +2618,15 @@ class CodexTelegramBot:
         if task.phase != "completed":
             self.send(chat_id, f"Task is {task.phase}; only completed tasks can be continued.")
             return None
+        # Codex only reveals its session id in the run log; Claude stores its own.
         if not task.codex_session_id and task.run_log_path:
-            task.codex_session_id = extract_session_id(Path(task.run_log_path))
-            if task.codex_session_id:
+            recovered = extract_session_id(Path(task.run_log_path))
+            if recovered:
+                task.codex_session_id = recovered
                 self.store.save_task(task)
-        if not task.codex_session_id:
-            self.send(chat_id, f"Task {task.id} has no saved Codex session id; cannot continue it.")
-            return None
+        # A missing session only costs conversation history: the continuation
+        # prompt still carries the parent task context, so the follow-up runs
+        # as a fresh conversation instead of being refused.
         return task
 
     def active_followup_for_parent(
@@ -2678,6 +2680,7 @@ class CodexTelegramBot:
             source_path="",
             parent_task_id=parent.id,
             codex_session_id=parent.codex_session_id,
+            claude_session_id=parent.claude_session_id,
         )
 
     def start_continue_input(self, chat_id: int, task_id: str) -> None:
@@ -3426,6 +3429,7 @@ class CodexTelegramBot:
             source_path=source_path,
             parent_task_id=parent.id,
             codex_session_id=parent.codex_session_id,
+            claude_session_id=parent.claude_session_id,
         )
         self.append_event(
             task.id,

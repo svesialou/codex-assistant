@@ -783,6 +783,77 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(spawned[0][0].__name__, "execute_followup_task")
         self.assertIn("Send follow-up instruction", sent[0])
 
+    def test_continue_button_works_for_claude_task_without_codex_session(self) -> None:
+        """Regression: the Continue button refused any task Claude had executed,
+        because it required a Codex session id that Claude never produces."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[str] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text)
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            parent = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="initial work",
+            )
+            parent.phase = "completed"
+            parent.executor_provider = "claude"
+            parent.claude_session_id = "75f09777-6e94-4c2e-8799-c3666c8533ed"
+            bot.store.save_task(parent)
+
+            bot.start_continue_input(10, parent.id)
+            bot.handle_plain_text(10, 20, "continue with claude")
+            bot.flush_prompt_draft(10)
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+            followups = [task for task in tasks if task.parent_task_id == parent.id]
+
+        self.assertFalse(any("cannot continue" in item for item in sent))
+        self.assertEqual(len(followups), 1)
+        self.assertEqual(followups[0].prompt, "continue with claude")
+        # The child must inherit the Claude session so the run can --resume it.
+        self.assertEqual(followups[0].claude_session_id, parent.claude_session_id)
+        self.assertEqual(spawned[0][0].__name__, "execute_followup_task")
+
+    def test_continue_button_works_without_any_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            bot.projects = [demo_project()]
+            sent: list[str] = []
+            spawned: list[tuple[object, tuple[object, ...]]] = []
+            bot.send = lambda chat_id, text, reply_markup=None: sent.append(text)
+            bot.spawn = lambda target, *args: spawned.append((target, args))
+            parent = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="initial work",
+            )
+            parent.phase = "completed"
+            bot.store.save_task(parent)
+
+            bot.start_continue_input(10, parent.id)
+            bot.handle_plain_text(10, 20, "keep going")
+            bot.flush_prompt_draft(10)
+
+            tasks = bot.store.recent_tasks(10, limit=10)
+            followups = [task for task in tasks if task.parent_task_id == parent.id]
+
+        self.assertFalse(any("cannot continue" in item for item in sent))
+        self.assertEqual(len(followups), 1)
+        self.assertEqual(followups[0].claude_session_id, "")
+        self.assertEqual(followups[0].codex_session_id, "")
+        self.assertEqual(spawned[0][0].__name__, "execute_followup_task")
+
     def test_followup_context_button_creates_draft_and_run_starts_it(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(tmp)

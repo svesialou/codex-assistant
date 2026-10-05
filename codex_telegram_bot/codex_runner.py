@@ -279,7 +279,7 @@ Telegram task state:
 - recovery attempt: {task.recovery_attempts}
 - previous run log path: {task.run_log_path or "-"}
 - previous final answer path: {task.final_path or "-"}
-- Codex session id available: {"yes" if task.codex_session_id else "no"}
+- executor session id available: {"yes" if (task.codex_session_id or task.claude_session_id) else "no"}
 
 Original task:
 {task.prompt}
