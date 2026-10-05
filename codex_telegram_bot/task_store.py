@@ -34,7 +34,10 @@ class TaskRecord:
     source: str = "text"
     source_path: str = ""
     parent_task_id: str = ""
+    # Codex session id. Kept under the historical name so existing task records
+    # stay readable; use session_id_for()/set_session_id() for provider-aware access.
     codex_session_id: str = ""
+    claude_session_id: str = ""
     phase: str = "created"
     clarifications: list[str] = field(default_factory=list)
     attachments: list[dict[str, Any]] = field(default_factory=list)
@@ -54,6 +57,7 @@ class TaskRecord:
     last_run_summary: str = ""
     next_actions: list[str] = field(default_factory=list)
     model_routing: dict[str, Any] = field(default_factory=dict)
+    executor_provider: str = ""
     memory_refs: list[str] = field(default_factory=list)
     trace_id: str = ""
     orchestrator_enabled: bool = False
@@ -75,6 +79,19 @@ class TaskRecord:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def session_id_for(self, provider: str) -> str:
+        if provider == "claude":
+            return self.claude_session_id
+        return self.codex_session_id
+
+    def set_session_id(self, provider: str, value: str) -> None:
+        if not value:
+            return
+        if provider == "claude":
+            self.claude_session_id = value
+        else:
+            self.codex_session_id = value
+
 
 @dataclass
 class ChatState:
@@ -84,6 +101,7 @@ class ChatState:
     agent_mode: bool = False
     agent_conversation_mode: bool = True
     orchestrator_mode: bool | None = None
+    task_provider: str | None = None
     debug_mode: bool = False
     memory_enabled: bool | None = None
     orchestrator_default_tier: str = "auto"
@@ -106,6 +124,13 @@ class ChatState:
     pending_memory_text: str = ""
     pending_alias_name: str = ""
     pending_alias_project_slug: str = ""
+    pending_project_choice_action: str = ""
+    pending_project_choice_user_id: int | None = None
+    pending_project_choice_text: str = ""
+    pending_project_choice_source: str = "text"
+    pending_project_choice_source_path: str = ""
+    pending_project_choice_manual_tier: str = "auto"
+    pending_project_choice_at: float = 0.0
     updated_at: str = field(default_factory=now_iso)
 
     @classmethod

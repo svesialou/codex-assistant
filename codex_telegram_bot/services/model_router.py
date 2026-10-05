@@ -4,7 +4,7 @@ import re
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from ..config import Config
+from ..config import Config, normalize_task_provider
 from ..task_store import TaskRecord
 
 
@@ -61,6 +61,7 @@ class RoutingDecision:
     routing_reason: str
     estimated_tokens: int
     manual_tier: str = "auto"
+    executor_provider: str = "codex"
     escalations: list[str] = field(default_factory=list)
     downgrades: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -69,6 +70,7 @@ class RoutingDecision:
         payload = asdict(self)
         payload["complexity"] = self.classification.complexity
         payload["selected_tier"] = self.classification.recommended_codex_tier
+        payload["executor_provider"] = self.executor_provider
         return payload
 
 
@@ -172,9 +174,15 @@ class ModelRouter:
             estimated_risk="high",
         )
 
-    def route(self, task: TaskRecord, manual_tier: str | None = None) -> RoutingDecision:
+    def route(
+        self,
+        task: TaskRecord,
+        manual_tier: str | None = None,
+        executor_provider: str | None = None,
+    ) -> RoutingDecision:
         classification = self.classify(task)
         tier = normalize_manual_tier(manual_tier)
+        provider = normalize_task_provider(executor_provider or self.config.task_provider)
         if tier is None:
             tier = (
                 "auto"
@@ -211,6 +219,11 @@ class ModelRouter:
             elif self.config.orchestrator_require_confirm_for_max:
                 warnings.append("max tier requires user confirmation")
 
+        executor_model = (
+            self.config.models.claude.for_tier(routed.recommended_codex_tier)
+            if provider == "claude"
+            else self.config.models.codex.for_tier(routed.recommended_codex_tier)
+        )
         selected_models = {
             "classifier": self.config.models.claude.for_tier("cheap"),
             "architect": self.config.models.claude.for_tier(
@@ -218,14 +231,14 @@ class ModelRouter:
             )
             if routed.recommended_claude_architect_tier != "none"
             else None,
-            "executor": self.config.models.codex.for_tier(routed.recommended_codex_tier),
+            "executor": executor_model,
             "reviewer": self.config.models.claude.for_tier(
                 routed.recommended_claude_reviewer_tier
             )
             if routed.recommended_claude_reviewer_tier != "none"
             else None,
         }
-        flow = render_selected_flow(routed)
+        flow = render_selected_flow(routed, provider)
         estimated_tokens = self.config.orchestrator_budget.per_task_token_budget.get(
             routed.complexity,
             0,
@@ -237,6 +250,7 @@ class ModelRouter:
             routing_reason=routed.reasoning_summary,
             estimated_tokens=estimated_tokens,
             manual_tier=tier,
+            executor_provider=provider,
             escalations=escalations,
             downgrades=downgrades,
             warnings=warnings,
@@ -291,13 +305,17 @@ def replace_complexity(
     return TaskClassification(**data)
 
 
-def render_selected_flow(classification: TaskClassification) -> str:
+def render_selected_flow(
+    classification: TaskClassification,
+    executor_provider: str = "codex",
+) -> str:
+    executor_name = "Claude" if executor_provider == "claude" else "Codex"
     if not classification.requires_architect and not classification.requires_reviewer:
-        return f"Codex {classification.recommended_codex_tier} only"
+        return f"{executor_name} {classification.recommended_codex_tier} only"
     parts: list[str] = []
     if classification.requires_architect:
         parts.append(f"Claude Architect {classification.recommended_claude_architect_tier}")
-    parts.append(f"Codex {classification.recommended_codex_tier}")
+    parts.append(f"{executor_name} {classification.recommended_codex_tier}")
     if classification.requires_reviewer:
         parts.append(f"Claude Reviewer {classification.recommended_claude_reviewer_tier}")
     if classification.requires_debate:
@@ -310,6 +328,7 @@ def render_routing_decision(decision: RoutingDecision) -> str:
         "ModelRouter:",
         f"- complexity: {decision.classification.complexity}",
         f"- selected flow: {decision.selected_flow}",
+        f"- executor provider: {decision.executor_provider}",
         f"- reason: {decision.routing_reason}",
     ]
     if decision.manual_tier != "auto":

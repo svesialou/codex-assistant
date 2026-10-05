@@ -9,7 +9,7 @@ from codex_telegram_bot.services.model_router import ModelRouter
 from codex_telegram_bot.task_store import TaskRecord
 
 
-def config_for(tmp: str) -> Config:
+def config_for(tmp: str, task_provider: str = "codex") -> Config:
     return Config(
         bot_token="token",
         allowed_chat_ids={1},
@@ -26,6 +26,7 @@ def config_for(tmp: str) -> Config:
         transcribe_command=None,
         transcribe_timeout_seconds=300,
         env_file=Path(tmp) / "telegram.env",
+        task_provider=task_provider,
     )
 
 
@@ -52,6 +53,14 @@ class ModelRouterTest(unittest.TestCase):
         self.assertFalse(decision.classification.requires_reviewer)
         self.assertEqual(decision.classification.recommended_codex_tier, "cheap")
         self.assertIn("Codex cheap only", decision.selected_flow)
+
+    def test_executor_provider_defaults_to_configured_task_provider(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = ModelRouter(config_for(tmp, task_provider="claude"))
+            decision = router.route(task("Исправь typo в README"))
+
+        self.assertEqual(decision.executor_provider, "claude")
+        self.assertIn("Claude cheap only", decision.selected_flow)
 
     def test_large_task_uses_architect_reviewer_and_strong_tier(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

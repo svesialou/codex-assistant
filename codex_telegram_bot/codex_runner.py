@@ -7,8 +7,17 @@ import signal
 import subprocess
 from pathlib import Path
 
-from .config import Config
+from .config import DEFAULT_TASK_PROVIDER, Config, normalize_task_provider
 from .project_index import ProjectInfo
+from .services.executors import (
+    MODE_EXECUTE,
+    MODE_FORCE_PUSH,
+    MODE_PLAN,
+    MODE_RESUME,
+    Executor,
+    build_executors,
+    resolve_executor,
+)
 from .task_store import TaskRecord, TaskStore, process_start_time
 
 SESSION_ID_RE = re.compile(r"(?im)^session id:\s*([^\s]+)")
@@ -343,6 +352,54 @@ Treat attached files as user-provided local inputs. Use their paths only when ne
 """
 
 
+def force_push_prompt(
+    task: TaskRecord,
+    context: str,
+    parent_task: TaskRecord | None,
+) -> str:
+    parent_id = parent_task.id if parent_task is not None else task.parent_task_id or "-"
+    parent_project = (
+        f"{parent_task.project_name} ({parent_task.project_path})"
+        if parent_task is not None
+        else "-"
+    )
+    parent_log_path = parent_task.run_log_path if parent_task is not None else ""
+    parent_final_path = parent_task.final_path if parent_task is not None else ""
+    return f"""This Telegram action was explicitly triggered by the completed task's Force push button.
+
+Execute only the force-push action needed for the completed task. Do not edit files. Do not commit.
+Use `git push --force-with-lease`, not plain `--force`.
+Before pushing, inspect the current branch and upstream. Do not force-push protected branches `main` or `master`.
+If the target repository is ambiguous, stop and explain the ambiguity instead of guessing.
+The user communicates in Russian; final answer must be in Russian and use:
+
+- Changed:
+- Why:
+- Verified:
+- Risks / Notes:
+
+Force push task:
+- id: {task.id}
+- project name: {task.project_name}
+- project path: {task.project_path}
+- project slug: {task.project_slug}
+
+Parent completed task:
+- id: {parent_id}
+- project: {parent_project}
+- run log path: {parent_log_path or "-"}
+- final answer path: {parent_final_path or "-"}
+
+If `project path` is not a git repository, use the parent task artifacts above and the project context below to find the repository changed by the completed task.
+
+Project agent context:
+{context}
+
+Original force-push instruction:
+{task.prompt}
+"""
+
+
 def agent_chat_prompt(task: TaskRecord, context: str) -> str:
     return f"""You are Codex running as a read-only AI agent for a Telegram chat.
 
@@ -374,57 +431,123 @@ class CodexRunner:
         self.config = config
         self.store = store
         self.runtime_id = runtime_id or secrets.token_hex(8)
+        self.executors = build_executors(config)
 
-    def _command_env(self) -> dict[str, str]:
+    def _command_env(self, provider: str, model: str | None = None) -> dict[str, str]:
         env = os.environ.copy()
         env["CODEX_TELEGRAM_SUPPRESS_STOP_HOOK"] = "1"
+        if provider == "claude" and model:
+            env["LLM_MODEL"] = model
+            env["CLAUDE_MODEL"] = model
         return env
 
-    def _base_command(
-        self,
-        project_path: str,
-        output_path: Path,
-        model: str | None = None,
-    ) -> list[str]:
-        command = [
-            self.config.codex_bin,
-            "exec",
-            "-C",
-            project_path,
-            "--skip-git-repo-check",
-            "-c",
-            'approval_policy="never"',
-            "-o",
-            str(output_path),
-        ]
-        selected_model = model or self.config.model
-        if selected_model:
-            command.extend(["-m", selected_model])
-        return command
+    def executor_for(self, provider: str) -> Executor:
+        return resolve_executor(self.executors, provider, self.config.task_provider)
 
-    def _resume_command(
+    def provider_unavailable_reason(self, provider: str) -> str:
+        return self.executor_for(provider).unavailable_reason()
+
+    def _fail_task(self, task: TaskRecord, error: str) -> TaskRecord:
+        task.phase = "failed"
+        task.error = error
+        self.store.save_task(task)
+        return task
+
+    def _run_provider(
         self,
-        session_id: str,
+        task: TaskRecord,
+        *,
+        provider: str,
+        mode: str,
+        prompt_path: Path,
         output_path: Path,
-        model: str | None = None,
-    ) -> list[str]:
-        command = [
-            self.config.codex_bin,
-            "exec",
-            "resume",
-            "--skip-git-repo-check",
-            "-c",
-            'approval_policy="never"',
-            "-c",
-            'sandbox_mode="danger-full-access"',
-            "-o",
-            str(output_path),
-        ]
-        selected_model = model or self.config.model
-        if selected_model:
-            command.extend(["-m", selected_model])
-        command.extend([session_id, "-"])
-        return command
+        log_path: Path,
+        model: str | None,
+        timeout_seconds: int | None,
+        success_phase: str,
+        timeout_error: str,
+        failed_error_prefix: str,
+    ) -> TaskRecord:
+        """Spawn one executor run and fold its outcome back into the task."""
+        executor = self.executor_for(provider)
+        unavailable = executor.unavailable_reason()
+        if unavailable:
+            return self._fail_task(task, unavailable)
+
+        try:
+            command = executor.build(
+                mode,
+                project_path=task.project_path,
+                output_path=output_path,
+                model=model,
+                session_id=task.session_id_for(provider),
+            )
+        except ValueError as exc:
+            return self._fail_task(task, str(exc))
+
+        if not command.argv:
+            return self._fail_task(task, f"{executor.name} executor command is empty.")
+
+        if command.session_id:
+            task.set_session_id(provider, command.session_id)
+            self.store.save_task(task)
+
+        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
+            log.write(f"\n[{executor.name} executor started: mode={mode}]\n".encode("utf-8"))
+            log.flush()
+            if command.final_answer_on_stdout:
+                stdout_target = output_path.open("wb")
+                stderr_target = log
+            else:
+                stdout_target = log
+                stderr_target = subprocess.STDOUT
+            try:
+                try:
+                    process = subprocess.Popen(
+                        command.argv,
+                        stdin=stdin,
+                        stdout=stdout_target,
+                        stderr=stderr_target,
+                        cwd=task.project_path,
+                        start_new_session=True,
+                        env=self._command_env(provider, model),
+                    )
+                except OSError as exc:
+                    return self._fail_task(
+                        task,
+                        f"{executor.name} execution failed to start: {exc}",
+                    )
+                self._mark_process_started(task, process)
+                try:
+                    returncode = process.wait(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    returncode = wait_after_stop(process)
+                    task.phase = "failed"
+                    task.error = timeout_error
+                else:
+                    task.returncode = returncode
+                    if returncode == 0:
+                        task.phase = success_phase
+                    else:
+                        task.phase = "failed"
+                        task.error = f"{failed_error_prefix} with exit code {returncode}."
+            finally:
+                if stdout_target is not log:
+                    stdout_target.close()
+
+        if command.session_id_from_log:
+            task.set_session_id(provider, extract_session_id(log_path))
+        self._mark_process_finished(task)
+        return task
+
+    def _resolve_mode(self, provider: str, task: TaskRecord, writable: bool) -> str:
+        """Resume when the provider can and a session exists, otherwise start fresh."""
+        if not writable:
+            return MODE_PLAN
+        executor = self.executor_for(provider)
+        if executor.supports_resume() and task.session_id_for(provider):
+            return MODE_RESUME
+        return MODE_EXECUTE
 
     def _mark_process_started(
         self,
@@ -446,10 +569,13 @@ class CodexRunner:
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "planning"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         plan_path = task_dir / "plan.md"
         log_path = task_dir / "plan.log"
@@ -460,37 +586,27 @@ class CodexRunner:
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(planning_prompt(task, context), encoding="utf-8")
 
-        command = self._base_command(task.project_path, plan_path, model=model)
-        command.extend(["-s", "read-only", "-"])
+        task = self._run_provider(
+            task,
+            provider=provider,
+            mode=MODE_PLAN,
+            prompt_path=prompt_path,
+            output_path=plan_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.plan_timeout_seconds,
+            success_phase="planned",
+            timeout_error="Planning timed out.",
+            failed_error_prefix="Planning failed",
+        )
 
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.plan_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Planning timed out."
+        if task.phase == "planned":
+            if plan_path.exists():
+                task.plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
             else:
-                task.returncode = returncode
-                if returncode == 0 and plan_path.exists():
-                    task.phase = "planned"
-                    task.plan_text = plan_path.read_text(encoding="utf-8", errors="replace")
-                else:
-                    task.phase = "failed"
-                    task.error = f"Planning failed with exit code {returncode}."
-
-        task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        self._mark_process_finished(task)
+                task.phase = "failed"
+                task.error = "Planning produced no plan output."
+            self.store.save_task(task)
         return task
 
     def run_execution(
@@ -498,10 +614,13 @@ class CodexRunner:
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / "final.md"
         log_path = task_dir / "run.log"
@@ -514,47 +633,32 @@ class CodexRunner:
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
-        command = self._base_command(task.project_path, final_path, model=model)
-        command.extend(["-s", "danger-full-access", "-"])
-
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.run_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Execution timed out."
-            else:
-                task.returncode = returncode
-                if returncode == 0:
-                    task.phase = "completed"
-                else:
-                    task.phase = "failed"
-                    task.error = f"Execution failed with exit code {returncode}."
-
-        task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        self._mark_process_finished(task)
-        return task
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=MODE_EXECUTE,
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.run_timeout_seconds,
+            success_phase="completed",
+            timeout_error="Execution timed out.",
+            failed_error_prefix="Execution failed",
+        )
 
     def run_recovery_execution(
         self,
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task.recovery_attempts += 1
         task_dir = self.store.task_dir(task.id)
         final_path = Path(task.final_path) if task.final_path else task_dir / "final.md"
@@ -565,7 +669,7 @@ class CodexRunner:
         task.final_path = str(final_path)
         task.run_log_path = str(log_path)
         task.prompt_path = str(prompt_path)
-        if not task.codex_session_id:
+        if provider == "codex" and not task.codex_session_id:
             task.codex_session_id = extract_session_id(log_path)
         self.store.save_task(task)
 
@@ -580,57 +684,32 @@ class CodexRunner:
             encoding="utf-8",
         )
 
-        resume_session_id = task.codex_session_id
-        if resume_session_id:
-            command = self._resume_command(resume_session_id, final_path, model=model)
-        else:
-            command = self._base_command(task.project_path, final_path, model=model)
-            command.extend(["-s", "danger-full-access", "-"])
-
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.run_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Recovered execution timed out."
-            else:
-                task.returncode = returncode
-                if returncode == 0:
-                    task.phase = "completed"
-                else:
-                    task.phase = "failed"
-                    task.error = f"Recovered execution failed with exit code {returncode}."
-
-        task.codex_session_id = extract_session_id(log_path) or resume_session_id
-        self._mark_process_finished(task)
-        return task
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=self._resolve_mode(provider, task, writable=True),
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.run_timeout_seconds,
+            success_phase="completed",
+            timeout_error="Recovered execution timed out.",
+            failed_error_prefix="Recovered execution failed",
+        )
 
     def run_followup_execution(
         self,
         task: TaskRecord,
         project: ProjectInfo,
         model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
     ) -> TaskRecord:
-        if not task.codex_session_id:
-            task.phase = "failed"
-            task.error = "Parent Codex session id is missing."
-            self.store.save_task(task)
-            return task
-
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / "final.md"
         log_path = task_dir / "run.log"
@@ -647,37 +726,63 @@ class CodexRunner:
             encoding="utf-8",
         )
 
-        resume_session_id = task.codex_session_id
-        command = self._resume_command(resume_session_id, final_path, model=model)
+        # The continuation prompt carries the parent task context, so a missing
+        # session only costs conversation history, not the follow-up itself.
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=self._resolve_mode(provider, task, writable=True),
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.run_timeout_seconds,
+            success_phase="completed",
+            timeout_error="Continuation timed out.",
+            failed_error_prefix="Continuation failed",
+        )
 
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.run_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Continuation timed out."
-            else:
-                task.returncode = returncode
-                if returncode == 0:
-                    task.phase = "completed"
-                else:
-                    task.phase = "failed"
-                    task.error = f"Continuation failed with exit code {returncode}."
+    def run_force_push_agent(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        parent_task: TaskRecord | None,
+        model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
+    ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
+        task.phase = "running"
+        task.returncode = None
+        task.error = ""
+        task.executor_provider = provider
+        task_dir = self.store.task_dir(task.id)
+        final_path = task_dir / "force-push-final.md"
+        log_path = task_dir / "force-push.log"
+        prompt_path = task_dir / "force-push-prompt.md"
+        task.final_path = str(final_path)
+        task.run_log_path = str(log_path)
+        task.prompt_path = str(prompt_path)
+        self.store.save_task(task)
 
-        task.codex_session_id = extract_session_id(log_path) or resume_session_id
-        self._mark_process_finished(task)
-        return task
+        context = read_task_context(self.config.index_dir, task, project)
+        prompt_path.write_text(
+            force_push_prompt(task, context, parent_task),
+            encoding="utf-8",
+        )
+
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=MODE_FORCE_PUSH,
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.run_timeout_seconds,
+            success_phase="completed",
+            timeout_error="Force push agent timed out.",
+            failed_error_prefix="Force push agent failed",
+        )
 
     def run_revision_execution(
         self,
@@ -685,10 +790,13 @@ class CodexRunner:
         project: ProjectInfo,
         round_number: int,
         model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
     ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / f"final-revision-{round_number}.md"
         log_path = task_dir / "run.log"
@@ -701,46 +809,32 @@ class CodexRunner:
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
-        resume_session_id = task.codex_session_id
-        if resume_session_id:
-            command = self._resume_command(resume_session_id, final_path, model=model)
-        else:
-            command = self._base_command(task.project_path, final_path, model=model)
-            command.extend(["-s", "danger-full-access", "-"])
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=self._resolve_mode(provider, task, writable=True),
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.run_timeout_seconds,
+            success_phase="completed",
+            timeout_error="Revision execution timed out.",
+            failed_error_prefix="Revision execution failed",
+        )
 
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.run_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Revision execution timed out."
-            else:
-                task.returncode = returncode
-                if returncode == 0:
-                    task.phase = "completed"
-                else:
-                    task.phase = "failed"
-                    task.error = f"Revision execution failed with exit code {returncode}."
-
-        task.codex_session_id = extract_session_id(log_path) or resume_session_id
-        self._mark_process_finished(task)
-        return task
-
-    def run_agent_chat(self, task: TaskRecord, project: ProjectInfo) -> TaskRecord:
+    def run_agent_chat(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        model: str | None = None,
+        provider: str = DEFAULT_TASK_PROVIDER,
+    ) -> TaskRecord:
+        provider = normalize_task_provider(provider)
         task.phase = "agent_running"
         task.returncode = None
         task.error = ""
+        task.executor_provider = provider
         task_dir = self.store.task_dir(task.id)
         final_path = task_dir / "agent.md"
         log_path = task_dir / "agent.log"
@@ -753,34 +847,16 @@ class CodexRunner:
         context = read_task_context(self.config.index_dir, task, project)
         prompt_path.write_text(agent_chat_prompt(task, context), encoding="utf-8")
 
-        command = self._base_command(task.project_path, final_path)
-        command.extend(["-s", "read-only", "-"])
-
-        with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
-            process = subprocess.Popen(
-                command,
-                stdin=stdin,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                cwd=task.project_path,
-                start_new_session=True,
-                env=self._command_env(),
-            )
-            self._mark_process_started(task, process)
-            try:
-                returncode = process.wait(timeout=self.config.plan_timeout_seconds)
-            except subprocess.TimeoutExpired:
-                returncode = wait_after_stop(process)
-                task.phase = "failed"
-                task.error = "Agent response timed out."
-            else:
-                task.returncode = returncode
-                if returncode == 0:
-                    task.phase = "agent_completed"
-                else:
-                    task.phase = "failed"
-                    task.error = f"Agent response failed with exit code {returncode}."
-
-        task.codex_session_id = extract_session_id(log_path) or task.codex_session_id
-        self._mark_process_finished(task)
-        return task
+        return self._run_provider(
+            task,
+            provider=provider,
+            mode=MODE_PLAN,
+            prompt_path=prompt_path,
+            output_path=final_path,
+            log_path=log_path,
+            model=model,
+            timeout_seconds=self.config.plan_timeout_seconds,
+            success_phase="agent_completed",
+            timeout_error="Agent response timed out.",
+            failed_error_prefix="Agent response failed",
+        )

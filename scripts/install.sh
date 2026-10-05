@@ -93,7 +93,7 @@ CODEX_HOST_WORKSPACE_ROOT=${CODEX_HOST_WORKSPACE_ROOT:-${HOME}}
 CODEX_TELEGRAM_PROJECT_DIRS=${CODEX_TELEGRAM_PROJECT_DIRS:-${HOME}/Projects:${HOME}/MyProjects}
 HOST_UID=$(id -u)
 HOST_GID=$(id -g)
-CODEX_CLI_VERSION=0.135.0
+CODEX_CLI_VERSION=0.145.0
 ENV
   echo "created ${COMPOSE_ENV_FILE}"
 else
@@ -102,7 +102,7 @@ else
   ensure_compose_env "CODEX_TELEGRAM_PROJECT_DIRS" "${CODEX_TELEGRAM_PROJECT_DIRS:-${HOME}/Projects:${HOME}/MyProjects}"
   ensure_compose_env "HOST_UID" "$(id -u)"
   ensure_compose_env "HOST_GID" "$(id -g)"
-  ensure_compose_env "CODEX_CLI_VERSION" "0.135.0"
+  ensure_compose_env "CODEX_CLI_VERSION" "0.145.0"
 fi
 
 echo "installed codex assistant into ${CODEX_HOME}"

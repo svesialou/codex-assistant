@@ -144,7 +144,7 @@ CODEX_HOST_WORKSPACE_ROOT=/home/your-user
 CODEX_TELEGRAM_PROJECT_DIRS=/home/your-user/Projects:/home/your-user/MyProjects
 HOST_UID=1000
 HOST_GID=1000
-CODEX_CLI_VERSION=0.135.0
+CODEX_CLI_VERSION=0.145.0
 ```
 
 If your projects live elsewhere, set `CODEX_HOST_WORKSPACE_ROOT` to their common
@@ -236,7 +236,11 @@ CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX=1
 CODEX_ORCHESTRATOR_DEBATE=0
 CODEX_ORCHESTRATOR_MAX_REVIEW_ROUNDS=2
 CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX=1
+CODEX_TELEGRAM_TASK_PROVIDER=claude   # codex or claude (default: claude)
 CODEX_CLAUDE_CMD='your-claude-wrapper'
+CODEX_CLAUDE_EXEC_CMD='claude -p --output-format text --permission-mode bypassPermissions'
+CODEX_CLAUDE_READONLY_CMD='claude -p --output-format text --permission-mode plan'
+CODEX_CLAUDE_RESUME_ENABLED=1
 CLAUDE_CHEAP_MODEL=
 CLAUDE_STANDARD_MODEL=
 CLAUDE_STRONG_MODEL=
@@ -246,8 +250,38 @@ CODEX_STRONG_MODEL=
 CODEX_MAX_MODEL=
 ```
 
-Claude transport is optional. If it is not configured and fallback is enabled,
-orchestrated tasks run through Codex-only flow with a Telegram warning.
+### Executor providers
+
+`CODEX_TELEGRAM_TASK_PROVIDER` selects the CLI that actually runs the work.
+It defaults to `claude`. The Telegram Settings screen overrides it per chat
+without editing the env file, and the chosen provider is used by **every**
+runner path: planning, read-only agent chat, execution, interrupted-task
+recovery, orchestrator revisions, follow-ups and force push.
+
+Each provider is driven entirely by config:
+
+| Setting | Applies to | Purpose |
+| --- | --- | --- |
+| `CODEX_TELEGRAM_CODEX_BIN` | codex | Codex binary |
+| `CODEX_CLAUDE_EXEC_CMD` | claude | Writable runs (execution, revision, force push) |
+| `CODEX_CLAUDE_READONLY_CMD` | claude | Read-only runs (planning, agent chat) |
+| `CODEX_CLAUDE_RESUME_ENABLED` | claude | Allow `--resume` for follow-ups |
+| `CODEX_CLAUDE_ENABLED` | claude | Disable the provider entirely |
+
+Both Claude commands accept an optional `{model}` placeholder; without it the
+selected model is appended as `--model <model>`.
+
+Session continuity differs per provider. Codex prints its session id into the
+run log and the bot parses it; Claude is given a generated `--session-id` up
+front and follow-ups resume it with `--resume`. Session ids are stored per
+provider (`codex_session_id` / `claude_session_id`), so switching providers
+mid-task starts a fresh conversation instead of failing.
+
+If the selected provider cannot run (binary missing, disabled, unparseable
+command), the task fails with that reason. It never silently falls through to
+the other provider. The orchestrator may still fall back to Codex when
+`CODEX_ORCHESTRATOR_FALLBACK_TO_CODEX=1`, and only when Codex is itself usable.
+Settings shows the live status of both providers.
 
 Interrupted task recovery:
 

@@ -7,12 +7,14 @@ from pathlib import Path
 from unittest.mock import patch
 
 from codex_telegram_bot.config import (
+    DEFAULT_TASK_PROVIDER,
     Config,
     load_env_file,
     parse_bool,
     parse_csv_ints,
     parse_csv_strings,
     parse_path_list,
+    normalize_task_provider,
 )
 
 
@@ -56,6 +58,14 @@ EMPTY=
         expanded = parse_path_list("$CODEX_TEST_HOME/Projects", [])
         self.assertEqual(str(expanded[0]), "/tmp/codex-test-home/Projects")
 
+    def test_normalize_task_provider(self) -> None:
+        self.assertEqual(normalize_task_provider("Claude"), "claude")
+        self.assertEqual(normalize_task_provider("Codex"), "codex")
+        self.assertEqual(normalize_task_provider(None), DEFAULT_TASK_PROVIDER)
+        self.assertEqual(normalize_task_provider(None, "codex"), "codex")
+        with self.assertRaisesRegex(ValueError, "Invalid task provider"):
+            normalize_task_provider("unknown")
+
     def test_private_chat_defaults_to_same_allowed_user_id(self) -> None:
         with patch.dict(
             os.environ,
@@ -64,6 +74,8 @@ EMPTY=
                 "CODEX_TELEGRAM_BOT_TOKEN": "token",
                 "CODEX_TELEGRAM_CHAT_ID": "123",
                 "CODEX_TELEGRAM_WORKSPACE_ROOT": "/workspace",
+                "CODEX_TELEGRAM_TASK_PROVIDER": "claude",
+                "CODEX_CLAUDE_EXEC_CMD": "claude-wrapper -p",
             },
             clear=True,
         ):
@@ -76,6 +88,8 @@ EMPTY=
         self.assertTrue(config.orchestrator_default_mode)
         self.assertEqual(config.orchestrator_default_tier, "cheap")
         self.assertEqual(config.orchestrator_max_auto_tier, "strong")
+        self.assertEqual(config.task_provider, "claude")
+        self.assertEqual(config.claude_executor_command, "claude-wrapper -p")
 
     def test_interrupted_task_recovery_can_be_disabled(self) -> None:
         with patch.dict(
