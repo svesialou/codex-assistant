@@ -30,6 +30,19 @@ class TelegramFormatTest(unittest.TestCase):
             "<pre><code>if a &lt; b and c:</code></pre>",
         )
 
+    def test_bold_wraps_inline_code(self) -> None:
+        # Regression: agents write **`name`** and the asterisks leaked as text.
+        html = markdown_to_telegram_html(
+            "- **`keyword_history`** uses `a**b`; **`keywords_by_hash`:** [docs](https://x.io/a?b=1&c=2)"
+        )
+
+        self.assertEqual(
+            html,
+            "• <b><code>keyword_history</code></b> uses <code>a**b</code>; "
+            "<b><code>keywords_by_hash</code>:</b> "
+            '<a href="https://x.io/a?b=1&amp;c=2">docs</a>',
+        )
+
     def test_unclosed_fence_is_closed_and_reopened_across_chunks(self) -> None:
         chunks = balance_code_fences(["text\n```\ncode 1", "code 2\n```\nafter"])
 

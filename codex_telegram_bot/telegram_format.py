@@ -54,30 +54,29 @@ def markdown_to_telegram_html(text: str) -> str:
 
 
 def format_inline(line: str) -> str:
-    parts: list[str] = []
-    position = 0
-    for match in INLINE_CODE_RE.finditer(line):
-        parts.append(format_plain(line[position : match.start()]))
-        parts.append(f"<code>{html.escape(match.group(1), quote=False)}</code>")
-        position = match.end()
-    parts.append(format_plain(line[position:]))
-    return "".join(parts)
+    # Code spans and links become placeholders first, so emphasis may wrap
+    # them (`**`name`**`) while their content stays literal.
+    protected: list[str] = []
 
+    def protect(rendered: str) -> str:
+        protected.append(rendered)
+        return f"\x00{len(protected) - 1}\x00"
 
-def format_plain(text: str) -> str:
-    links: list[str] = []
-
-    def keep_link(match: re.Match[str]) -> str:
-        label = html.escape(match.group(1), quote=False)
-        url = html.escape(match.group(2), quote=True)
-        links.append(f'<a href="{url}">{label}</a>')
-        return f"\x00{len(links) - 1}\x00"
-
-    text = LINK_RE.sub(keep_link, text)
-    text = html.escape(text, quote=False)
-    text = BOLD_RE.sub(r"<b>\1</b>", text)
-    text = STRIKE_RE.sub(r"<s>\1</s>", text)
-    return re.sub(r"\x00(\d+)\x00", lambda match: links[int(match.group(1))], text)
+    line = INLINE_CODE_RE.sub(
+        lambda match: protect(f"<code>{html.escape(match.group(1), quote=False)}</code>"),
+        line,
+    )
+    line = LINK_RE.sub(
+        lambda match: protect(
+            f'<a href="{html.escape(match.group(2), quote=True)}">'
+            f"{html.escape(match.group(1), quote=False)}</a>"
+        ),
+        line,
+    )
+    line = html.escape(line, quote=False)
+    line = BOLD_RE.sub(r"<b>\1</b>", line)
+    line = STRIKE_RE.sub(r"<s>\1</s>", line)
+    return re.sub(r"\x00(\d+)\x00", lambda match: protected[int(match.group(1))], line)
 
 
 def balance_code_fences(chunks: list[str]) -> list[str]:
