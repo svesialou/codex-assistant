@@ -618,6 +618,51 @@ class ProviderRoutingTest(unittest.TestCase):
         self.assertIn("--session-id", argv)
         self.assertNotIn("--resume", argv)
 
+    def test_claude_stream_json_final_is_last_result_of_current_run(self) -> None:
+        counter = self.root / "runs.txt"
+        stream_bin = self._write_script(
+            "claude-stream",
+            "import json\n"
+            f"pathlib.Path({str(self.claude_args)!r}).write_text("
+            "'\\n'.join(sys.argv[1:]), encoding='utf-8')\n"
+            f"counter = pathlib.Path({str(counter)!r})\n"
+            "run = int(counter.read_text()) + 1 if counter.exists() else 1\n"
+            "counter.write_text(str(run))\n"
+            "sys.stdin.read()\n"
+            "print('stray stderr line', file=sys.stderr)\n"
+            "events = [{'type': 'system', 'subtype': 'init', 'session_id': 's'}]\n"
+            "if run == 1:\n"
+            "    events += [\n"
+            "        {'type': 'result', 'result': 'Agents started, waiting.'},\n"
+            "        {'type': 'result', 'result': '**Done** after agents'},\n"
+            "    ]\n"
+            "for event in events:\n"
+            "    print(json.dumps(event), flush=True)\n",
+        )
+        runner = self._runner()
+        runner.config = replace(
+            runner.config,
+            claude_executor_command=f"{stream_bin} -p --output-format stream-json",
+        )
+        runner.executors = build_executors(runner.config)
+        project = self._project()
+        task = self._task(runner, "stream-1")
+
+        executed = runner.run_execution(task, project, provider="claude")
+        final_text = Path(executed.final_path).read_text(encoding="utf-8").strip()
+
+        self.assertEqual(executed.phase, "completed")
+        self.assertEqual(final_text, "**Done** after agents")
+        self.assertIn("--verbose", self._claude_argv())
+
+        # The follow-up reuses run.log and final.md: results of the previous
+        # run must not leak into the new final answer.
+        followup = runner.run_followup_execution(executed, project, provider="claude")
+
+        self.assertEqual(followup.phase, "completed")
+        self.assertIn("--resume", self._claude_argv())
+        self.assertEqual(Path(followup.final_path).read_text(encoding="utf-8"), "")
+
     def test_unavailable_provider_fails_with_reason_instead_of_other_provider(self) -> None:
         runner = self._runner()
         runner.config = replace(runner.config, claude_enabled=False)

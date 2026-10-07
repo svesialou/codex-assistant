@@ -346,7 +346,7 @@ class OrchestratorService:
 
             review_round += 1
             if notify is not None:
-                notify("Claude reviewer: requested changes. Codex исправляет замечания.")
+                notify("Claude reviewer: requested changes. Agent исправляет замечания.")
             task.prepared_codex_prompt = review.follow_up_prompt_for_codex.strip()
             self.store.save_task(task)
             task = self.runner.run_revision_execution(

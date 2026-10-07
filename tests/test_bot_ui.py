@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import subprocess
+import threading
 import tempfile
 import unittest
 from pathlib import Path
@@ -247,6 +249,61 @@ class BotUiTest(unittest.TestCase):
 
         self.assertTrue(edited)
 
+    def test_finish_status_sends_subagent_results_and_checklist(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = test_config(tmp)
+            bot = CodexTelegramBot(config)
+            fake_api = FakeTelegramAPI()
+            bot.api = fake_api
+            task = bot.store.create_task(
+                chat_id=10,
+                user_id=20,
+                project_slug="demo",
+                project_name="demo",
+                project_path="/tmp/demo",
+                prompt="do work",
+            )
+            task.executor_provider = "claude"
+            log_path = Path(tmp) / "run.log"
+            tracker = bot_module.StreamTracker(log_path)
+            events = [
+                {"type": "assistant", "parent_tool_use_id": None, "message": {"content": [
+                    {"type": "tool_use", "id": "t1", "name": "Agent",
+                     "input": {"description": "review diff", "subagent_type": "reviewer"}},
+                    {"type": "tool_use", "id": "t2", "name": "Agent",
+                     "input": {"description": "search handlers", "subagent_type": "Explore"}},
+                ]}},
+                {"type": "assistant", "parent_tool_use_id": "t1", "message": {"content": [
+                    {"type": "text", "text": "No issues. API_TOKEN=abc123"}]}},
+                {"type": "system", "subtype": "task_notification", "tool_use_id": "t1",
+                 "status": "completed"},
+                {"type": "result", "result": "Final"},
+            ]
+            log_path.write_text(
+                "".join(json.dumps(event) + "\n" for event in events),
+                encoding="utf-8",
+            )
+            task.phase = "completed"
+            handle = bot_module.LiveStatusHandle(
+                chat_id=10,
+                message_id=42,
+                tracker=tracker,
+                lock=threading.Lock(),
+            )
+
+            bot.finish_codex_status(handle, task)
+            bot.finish_codex_status(handle, task)
+
+        results = [text for _chat, text, _markup in fake_api.sent]
+        self.assertEqual(len(results), 1)
+        self.assertIn("✅ Агент reviewer — review diff", results[0])
+        self.assertIn("API_TOKEN=<hidden>", results[0])
+        status = fake_api.edited[-1][2]
+        self.assertIn("Статус Agent · Claude", status)
+        self.assertIn("Агенты (1/2):", status)
+        self.assertIn("✅ reviewer — review diff", status)
+        self.assertIn("search handlers · не завершён", status)
+
     def test_live_status_edit_keeps_running_task_keyboard(self) -> None:
         class OneEditStopEvent:
             def __init__(self) -> None:
@@ -255,6 +312,9 @@ class BotUiTest(unittest.TestCase):
             def wait(self, _timeout: float) -> bool:
                 self.calls += 1
                 return self.calls > 1
+
+            def is_set(self) -> bool:
+                return False
 
         with tempfile.TemporaryDirectory() as tmp:
             config = test_config(tmp)
@@ -328,7 +388,7 @@ class BotUiTest(unittest.TestCase):
 
         summary = process_summary(tasks, pid_alive=lambda pid: pid == 111)
 
-        self.assertIn("Active Codex processes across projects: 1", summary)
+        self.assertIn("Active agent processes across projects: 1", summary)
         self.assertIn("Project: api", summary)
         self.assertIn("pid=111", summary)
         self.assertIn("Stale active task records: 1", summary)
@@ -346,8 +406,8 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(
             sent,
             [
-                "No active Codex processes across projects.",
-                "No active Codex processes across projects.",
+                "No active agent processes across projects.",
+                "No active agent processes across projects.",
             ],
         )
 
@@ -578,7 +638,7 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(loaded.phase, "created")
         self.assertIsNone(loaded_state.pending_action)
         self.assertEqual(spawned[0][1], (task.id, None))
-        self.assertIn("Статус Codex", sent[-1])
+        self.assertIn("Статус Agent", sent[-1])
         self.assertIn("Уточнение сохранено", sent[-1])
 
     def test_answer_button_on_running_task_saves_context_without_new_task(self) -> None:
@@ -651,7 +711,7 @@ class BotUiTest(unittest.TestCase):
         self.assertIsNone(loaded_state.pending_action)
         self.assertEqual(loaded_state.prompt_draft_parts, [])
         self.assertEqual(spawned[0][1], (tasks[0].id, None))
-        self.assertIn("Статус Codex", sent[-1])
+        self.assertIn("Статус Agent", sent[-1])
         self.assertIn("Задача создана", sent[-1])
 
     def test_task_command_can_collect_following_plain_text_parts(self) -> None:
@@ -694,7 +754,7 @@ class BotUiTest(unittest.TestCase):
         self.assertIsNone(loaded_state.pending_action)
         self.assertEqual(spawned[0][0].__name__, "execute_task")
         self.assertEqual(spawned[0][1], (tasks[0].id, None))
-        self.assertIn("Статус Codex", sent[-1])
+        self.assertIn("Статус Agent", sent[-1])
         self.assertIn("Orchestrator mode включён", sent[-1])
 
     def test_run_command_accepts_manual_tier_override(self) -> None:
@@ -1004,7 +1064,7 @@ class BotUiTest(unittest.TestCase):
         self.assertEqual(tasks[0].kind, "agent_chat")
         self.assertEqual(tasks[0].prompt, "part one\n\npart two")
         self.assertEqual(spawned[0][1], (tasks[0].id, None))
-        self.assertIn("Статус Codex", sent[-1])
+        self.assertIn("Статус Agent", sent[-1])
         self.assertIn("agent running", sent[-1])
 
     def test_agent_status_message_id_is_passed_to_worker_for_edits(self) -> None:
@@ -1028,7 +1088,7 @@ class BotUiTest(unittest.TestCase):
 
         self.assertEqual(len(tasks), 1)
         self.assertEqual(spawned[0][1], (tasks[0].id, 1))
-        self.assertIn("Статус Codex", bot.api.sent[0][1])
+        self.assertIn("Статус Agent", bot.api.sent[0][1])
 
     def test_prompt_draft_is_flushed_before_another_user_starts_one(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

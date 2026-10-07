@@ -38,6 +38,9 @@ class ExecutorCommand:
     # Codex writes the final answer itself via `-o`; Claude prints it on stdout
     # and the runner has to redirect it into the output file.
     final_answer_on_stdout: bool = False
+    # Claude in `--output-format stream-json` mode: stdout is a JSONL event
+    # stream that goes into the run log; the final answer is extracted from it.
+    final_answer_from_stream: bool = False
     # Whether the session id has to be recovered by parsing the run log.
     session_id_from_log: bool = True
 
@@ -206,6 +209,10 @@ class ClaudeExecutor(Executor):
             raise ValueError("Claude executor command is empty.")
         if selected_model and not has_model_placeholder:
             argv.extend(["--model", selected_model])
+        stream_json = uses_stream_json(argv)
+        if stream_json and "--verbose" not in argv:
+            # Claude rejects stream-json in print mode without --verbose.
+            argv.append("--verbose")
 
         if mode == MODE_RESUME:
             if not session_id:
@@ -221,9 +228,19 @@ class ClaudeExecutor(Executor):
         return ExecutorCommand(
             argv=argv,
             session_id=used_session_id,
-            final_answer_on_stdout=True,
+            final_answer_on_stdout=not stream_json,
+            final_answer_from_stream=stream_json,
             session_id_from_log=False,
         )
+
+
+def uses_stream_json(argv: list[str]) -> bool:
+    for index, arg in enumerate(argv):
+        if arg == "--output-format=stream-json":
+            return True
+        if arg == "--output-format" and argv[index + 1 : index + 2] == ["stream-json"]:
+            return True
+    return False
 
 
 def executor_display_name(provider: str) -> str:

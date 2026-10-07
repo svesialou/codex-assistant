@@ -118,11 +118,11 @@ def normalize_tier(value: str | None, default: str = "auto") -> str:
 TASK_PROVIDERS = ("codex", "claude")
 DEFAULT_TASK_PROVIDER = "claude"
 DEFAULT_CLAUDE_EXEC_COMMAND = (
-    "claude -p --output-format text --permission-mode bypassPermissions"
+    "claude -p --output-format stream-json --verbose --permission-mode bypassPermissions"
 )
 # Planning and agent chat must not touch the workspace.
 DEFAULT_CLAUDE_READONLY_COMMAND = (
-    "claude -p --output-format text --permission-mode plan"
+    "claude -p --output-format stream-json --verbose --permission-mode plan"
 )
 
 

@@ -18,6 +18,7 @@ from .services.executors import (
     build_executors,
     resolve_executor,
 )
+from .stream_events import StreamTracker
 from .task_store import TaskRecord, TaskStore, process_start_time
 
 SESSION_ID_RE = re.compile(r"(?im)^session id:\s*([^\s]+)")
@@ -207,6 +208,7 @@ def execution_prompt(task: TaskRecord, context: str) -> str:
 
 Follow global and project AGENTS instructions. Before editing, inspect relevant repo files and local instructions.
 Keep the change minimal and focused. Ask only if blocked by a risky decision that cannot be inferred.
+If you launch subagents, wait until every one of them has finished before writing the final answer.
 Run relevant checks where practical. Final answer must be in Russian and use:
 
 - Changed:
@@ -257,6 +259,7 @@ def interrupted_execution_prompt(
 Continue from the current workspace state. First inspect git status, relevant files, existing logs, and the existing final answer if useful.
 Do not assume that no work was done before the restart. Do not repeat already completed changes.
 Do not revert unrelated changes or user changes. If the requested work is already complete, verify it and produce the final response.
+If you launch subagents, wait until every one of them has finished before writing the final answer.
 Run relevant checks where practical. Final answer must be in Russian and use:
 
 - Changed:
@@ -320,6 +323,7 @@ def continuation_prompt(
 
 Follow global and project AGENTS instructions. Before editing, inspect relevant repo files and local instructions when needed.
 Keep the change minimal and focused. Ask only if blocked by a risky decision that cannot be inferred.
+If you launch subagents, wait until every one of them has finished before writing the final answer.
 Run relevant checks where practical. Final answer must be in Russian and use:
 
 - Changed:
@@ -495,6 +499,7 @@ class CodexRunner:
         with prompt_path.open("rb") as stdin, log_path.open("ab") as log:
             log.write(f"\n[{executor.name} executor started: mode={mode}]\n".encode("utf-8"))
             log.flush()
+            stream_offset = log.tell()
             if command.final_answer_on_stdout:
                 stdout_target = output_path.open("wb")
                 stderr_target = log
@@ -535,10 +540,35 @@ class CodexRunner:
                 if stdout_target is not log:
                     stdout_target.close()
 
+        if command.final_answer_from_stream:
+            self._write_stream_final(task, log_path, stream_offset, output_path)
         if command.session_id_from_log:
             task.set_session_id(provider, extract_session_id(log_path))
         self._mark_process_finished(task)
         return task
+
+    def _write_stream_final(
+        self,
+        task: TaskRecord,
+        log_path: Path,
+        offset: int,
+        output_path: Path,
+    ) -> None:
+        tracker = StreamTracker(log_path, offset=offset)
+        tracker.poll()
+        state = tracker.state
+        final = state.final_text
+        unfinished = tracker.mark_unfinished()
+        if unfinished:
+            names = ", ".join(
+                agent.description or agent.agent_type or agent.tool_use_id
+                for agent in unfinished
+            )
+            final = f"{final}\n\n⚠️ Агенты не завершили работу до выхода процесса: {names}".strip()
+        # Always rewrite: a reused final path must not keep a previous answer.
+        output_path.write_text(final + "\n" if final else "", encoding="utf-8")
+        if task.phase == "failed" and state.final_is_error and state.final_text:
+            task.error = f"{task.error} {state.final_text}".strip()
 
     def _resolve_mode(self, provider: str, task: TaskRecord, writable: bool) -> str:
         """Resume when the provider can and a session exists, otherwise start fresh."""
