@@ -62,7 +62,7 @@ class ActivityStatusTest(unittest.TestCase):
 
         text = render_codex_status(task, "planning", "Читаю файлы." * 500)
 
-        self.assertIn("Статус Codex", text)
+        self.assertIn("Статус Agent", text)
         self.assertIn("Задача: task-1", text)
         self.assertIn("Проект: demo", text)
         self.assertLessEqual(len(text), 1800)

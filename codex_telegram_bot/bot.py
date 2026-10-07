@@ -14,10 +14,16 @@ from datetime import date
 from pathlib import Path
 from typing import Any
 
-from .activity_status import extract_codex_activity, render_codex_status
+from .activity_status import extract_codex_activity, mask_secrets, render_codex_status
 from .agent_roles import AGENT_ROLES
 from .config import Config, normalize_task_provider
 from .codex_runner import CodexRunner, extract_session_id
+from .stream_events import (
+    SUBAGENT_COMPLETED,
+    SUBAGENT_FAILED,
+    StreamTracker,
+    readable_log_line,
+)
 from .project_index import (
     ProjectInfo,
     ROOT_PROJECT_SLUG,
@@ -77,7 +83,7 @@ from .voice import TranscriptionError, transcribe_audio
 LOG = logging.getLogger("codex_telegram_bot")
 
 
-HELP_TEXT = """Codex Telegram bot
+HELP_TEXT = """Agent Telegram bot
 
 Commands:
 /menu - show button menu
@@ -93,17 +99,17 @@ Commands:
 /settings orchestrator on|off|status - manage orchestration
 /settings provider codex|claude|status - choose main task executor
 /debug on|off - toggle debug trace details
-/ask <text> - ask Codex in read-only agent mode
-/task <project> <text> - create a Codex task in a project
+/ask <text> - ask the agent in read-only mode
+/task <project> <text> - create an agent task in a project
 /task <text> - create a task in the selected default project
 /run [tier=auto|cheap|standard|strong|max] <project> <text> - execute directly
 /run <text> - execute directly in the selected default project
 /answer <task_id> <text> - add clarification and rerun planning
 /confirm <task_id> - execute a planned task
 /continue <task_id> <text> - continue a completed task in its executor session
-/cancel <task_id> - cancel a task or stop a running Codex process
+/cancel <task_id> - cancel a task or stop a running agent process
 /status [task_id] - show global active processes or one task
-/processes - show active Codex processes across projects
+/processes - show active agent processes across projects
 /logs <task_id> - show recent execution log lines
 /brain <task_id> - show agent event log for a task
 /events <task_id> - same as /brain
@@ -122,15 +128,15 @@ Flow:
 
 BOT_COMMANDS = [
     {"command": "menu", "description": "Show main menu"},
-    {"command": "new", "description": "Start a planned Codex task"},
+    {"command": "new", "description": "Start a planned agent task"},
     {"command": "run", "description": "Run a task directly"},
-    {"command": "task", "description": "Create a planned Codex task"},
+    {"command": "task", "description": "Create a planned agent task"},
     {"command": "settings", "description": "Open settings"},
     {"command": "orchestrator_on", "description": "Enable orchestration"},
     {"command": "orchestrator_off", "description": "Disable orchestration"},
     {"command": "orchestrator_status", "description": "Show orchestrator status"},
     {"command": "status", "description": "Show processes or task status"},
-    {"command": "processes", "description": "Show active Codex processes"},
+    {"command": "processes", "description": "Show active agent processes"},
     {"command": "projects", "description": "List indexed projects"},
     {"command": "project", "description": "Select default project"},
     {"command": "alias", "description": "Manage project aliases"},
@@ -160,6 +166,7 @@ PROMPT_DRAFT_SEPARATOR = "\n\n"
 DEFAULT_CONTINUATION_PROMPT = "Continue development using the attached context."
 STATUS_POLL_SECONDS = 1.0
 STATUS_EDIT_MIN_SECONDS = 4.0
+SUBAGENT_RESULT_MAX_CHARS = 3500
 
 
 def configure_logging(state_dir: Path) -> None:
@@ -505,7 +512,9 @@ def tail_file(path: str, max_lines: int = 60) -> str:
     if not file_path.exists():
         return "Log file does not exist yet."
     lines = file_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    return "\n".join(lines[-max_lines:]) or "Log is empty."
+    # Claude stream-json events are large JSON blobs; show a readable summary.
+    readable = [line for line in map(readable_log_line, lines) if line is not None]
+    return "\n".join(readable[-max_lines:]) or "Log is empty."
 
 
 def read_task_final(task: TaskRecord) -> str:
@@ -566,6 +575,8 @@ class LiveStatusHandle:
     message_id: int | None
     stop_event: threading.Event | None = None
     thread: threading.Thread | None = None
+    tracker: StreamTracker | None = None
+    lock: threading.Lock | None = None
 
 
 def process_summary(
@@ -583,12 +594,12 @@ def process_summary(
     if not active:
         if stale_count:
             return (
-                "No active Codex processes across projects.\n"
+                "No active agent processes across projects.\n"
                 f"Stale active task records: {stale_count}."
             )
-        return "No active Codex processes across projects."
+        return "No active agent processes across projects."
 
-    lines = [f"Active Codex processes across projects: {len(active)}"]
+    lines = [f"Active agent processes across projects: {len(active)}"]
     for task in active:
         lines.extend(
             [
@@ -1063,9 +1074,12 @@ class CodexTelegramBot:
             return LiveStatusHandle(chat_id=task.chat_id, message_id=None)
 
         stop_event = threading.Event()
+        # Claude stream-json events appended after this point belong to this run.
+        tracker = StreamTracker(log_path)
+        lock = threading.Lock()
         thread = threading.Thread(
             target=self.watch_codex_status,
-            args=(task, phase, log_path, message_id, stop_event),
+            args=(task, phase, log_path, message_id, stop_event, tracker, lock),
             daemon=True,
         )
         self.worker_threads.add(thread)
@@ -1075,6 +1089,8 @@ class CodexTelegramBot:
             message_id=message_id,
             stop_event=stop_event,
             thread=thread,
+            tracker=tracker,
+            lock=lock,
         )
 
     def watch_codex_status(
@@ -1084,15 +1100,29 @@ class CodexTelegramBot:
         log_path: Path,
         message_id: int,
         stop_event: threading.Event,
+        tracker: StreamTracker | None = None,
+        lock: threading.Lock | None = None,
     ) -> None:
+        lock = lock or threading.Lock()
         last_text = render_codex_status(task, phase)
         last_edit = time.monotonic()
         while not stop_event.wait(STATUS_POLL_SECONDS):
-            activity = extract_codex_activity(log_path)
-            if not activity:
+            with lock:
+                if stop_event.is_set():
+                    return
+                if tracker is not None:
+                    tracker.poll()
+                if tracker is not None and tracker.state.events:
+                    self.send_subagent_results(task, tracker)
+                    activity = tracker.state.activity or None
+                    subagents = list(tracker.state.subagents.values())
+                else:
+                    activity = extract_codex_activity(log_path)
+                    subagents = []
+            if not activity and not subagents:
                 continue
 
-            text = render_codex_status(task, phase, activity)
+            text = render_codex_status(task, phase, activity, subagents)
             if text == last_text:
                 continue
             if time.monotonic() - last_edit < STATUS_EDIT_MIN_SECONDS:
@@ -1118,14 +1148,41 @@ class CodexTelegramBot:
             handle.stop_event.set()
         if handle.thread is not None:
             handle.thread.join(timeout=1)
+        subagents = []
+        if handle.tracker is not None:
+            # The run is over: flush the remaining events so every subagent
+            # result is delivered before the caller sends the final answer.
+            with handle.lock or threading.Lock():
+                handle.tracker.poll()
+                handle.tracker.mark_unfinished()
+                self.send_subagent_results(task, handle.tracker)
+                subagents = list(handle.tracker.state.subagents.values())
         if handle.message_id is None:
             return
         self.edit_message(
             handle.chat_id,
             handle.message_id,
-            render_codex_status(task, task.phase, activity),
+            render_codex_status(task, task.phase, activity, subagents),
             reply_markup=reply_markup,
         )
+
+    def send_subagent_results(self, task: TaskRecord, tracker: StreamTracker) -> None:
+        for agent in tracker.state.subagents.values():
+            # Unfinished agents are reported in the status and the final answer.
+            if agent.status not in (SUBAGENT_COMPLETED, SUBAGENT_FAILED) or agent.result_sent:
+                continue
+            agent.result_sent = True
+            icon = "✅" if agent.status == SUBAGENT_COMPLETED else "⚠️"
+            title = f"{icon} Агент {agent.agent_type or 'agent'}"
+            if agent.description:
+                title += f" — {agent.description}"
+            result = mask_secrets(agent.result.strip()) or "Агент не вернул результат."
+            if len(result) > SUBAGENT_RESULT_MAX_CHARS:
+                result = (
+                    result[:SUBAGENT_RESULT_MAX_CHARS].rstrip()
+                    + f"\n…\n(обрезано, полный текст: /logs {task.id})"
+                )
+            self.send(task.chat_id, f"{title}\nЗадача: {task.id}\n\n{result}")
 
     def handle_update(self, update: dict[str, Any]) -> None:
         if "message" in update:
@@ -2837,7 +2894,7 @@ class CodexTelegramBot:
         status_message_id = self.send_codex_status(
             task,
             "running",
-            f"Continuation draft {task.id} started from {parent.id}. Resuming Codex session.",
+            f"Continuation draft {task.id} started from {parent.id}. Resuming agent session.",
             reply_markup=running_task_keyboard(task.id),
         )
         self.append_event(
@@ -3446,7 +3503,7 @@ class CodexTelegramBot:
         status_message_id = self.send_codex_status(
             task,
             "running",
-            f"Continuation task {task.id} created from {parent.id}. Resuming Codex session.",
+            f"Continuation task {task.id} created from {parent.id}. Resuming agent session.",
             reply_markup=running_task_keyboard(task.id),
         )
         self.spawn(self.execute_followup_task, task.id, status_message_id)
@@ -4231,7 +4288,7 @@ class CodexTelegramBot:
 
     def send_startup_message(self) -> None:
         text = (
-            "Codex Telegram bot started.\n"
+            "Agent Telegram bot started.\n"
             f"Indexed projects: {len(self.projects)}\n"
             "Use /help."
         )

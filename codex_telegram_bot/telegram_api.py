@@ -8,6 +8,11 @@ import urllib.parse
 import urllib.request
 from typing import Any
 
+from .telegram_format import balance_code_fences, markdown_to_telegram_html
+
+
+TELEGRAM_TEXT_LIMIT = 4096
+
 
 class TelegramAPI:
     def __init__(self, bot_token: str) -> None:
@@ -61,15 +66,15 @@ class TelegramAPI:
         reply_markup: dict[str, Any] | None = None,
     ) -> int | None:
         first_message_id: int | None = None
-        for chunk in split_message(text):
-            response = self.request(
+        for chunk in balance_code_fences(split_message(text)):
+            response = self.request_formatted(
                 "sendMessage",
                 {
                     "chat_id": chat_id,
-                    "text": chunk,
                     "disable_web_page_preview": True,
                     "reply_markup": reply_markup,
                 },
+                chunk,
             )
             if first_message_id is None:
                 result = response.get("result") or {}
@@ -87,16 +92,35 @@ class TelegramAPI:
         text: str,
         reply_markup: dict[str, Any] | None = None,
     ) -> None:
-        self.request(
+        self.request_formatted(
             "editMessageText",
             {
                 "chat_id": chat_id,
                 "message_id": message_id,
-                "text": text,
                 "disable_web_page_preview": True,
                 "reply_markup": reply_markup,
             },
+            text,
         )
+
+    def request_formatted(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        text: str,
+    ) -> dict[str, Any]:
+        """Send Markdown-ish text as Telegram HTML, falling back to plain text."""
+        formatted = markdown_to_telegram_html(text)
+        if len(formatted) <= TELEGRAM_TEXT_LIMIT:
+            try:
+                return self.request(
+                    method,
+                    {**payload, "text": formatted, "parse_mode": "HTML"},
+                )
+            except RuntimeError as exc:
+                if "can't parse entities" not in str(exc).lower():
+                    raise
+        return self.request(method, {**payload, "text": text})
 
     def answer_callback_query(self, callback_query_id: str, text: str = "") -> None:
         self.request(
