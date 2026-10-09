@@ -14,6 +14,16 @@ case ":${PATH:-}:" in
     ;;
 esac
 
+# User-local CLIs (claude, pipx tools). systemd user services started at boot
+# do not get this from the login shell profile.
+case ":${PATH}:" in
+  *":${HOME}/.local/bin:"*)
+    ;;
+  *)
+    export PATH="${HOME}/.local/bin:${PATH}"
+    ;;
+esac
+
 codex_dev_env_socket_ok() {
   [ -n "${1:-}" ] && [ -S "$1" ]
 }
