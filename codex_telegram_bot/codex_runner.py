@@ -471,6 +471,7 @@ class CodexRunner:
         success_phase: str,
         timeout_error: str,
         failed_error_prefix: str,
+        effort: str | None = None,
     ) -> TaskRecord:
         """Spawn one executor run and fold its outcome back into the task."""
         executor = self.executor_for(provider)
@@ -485,6 +486,7 @@ class CodexRunner:
                 output_path=output_path,
                 model=model,
                 session_id=task.session_id_for(provider),
+                effort=effort,
             )
         except ValueError as exc:
             return self._fail_task(task, str(exc))
@@ -645,6 +647,7 @@ class CodexRunner:
         project: ProjectInfo,
         model: str | None = None,
         provider: str = DEFAULT_TASK_PROVIDER,
+        effort: str | None = None,
     ) -> TaskRecord:
         provider = normalize_task_provider(provider)
         task.phase = "running"
@@ -675,6 +678,7 @@ class CodexRunner:
             success_phase="completed",
             timeout_error="Execution timed out.",
             failed_error_prefix="Execution failed",
+            effort=effort,
         )
 
     def run_recovery_execution(
@@ -683,6 +687,7 @@ class CodexRunner:
         project: ProjectInfo,
         model: str | None = None,
         provider: str = DEFAULT_TASK_PROVIDER,
+        effort: str | None = None,
     ) -> TaskRecord:
         provider = normalize_task_provider(provider)
         task.phase = "running"
@@ -726,6 +731,7 @@ class CodexRunner:
             success_phase="completed",
             timeout_error="Recovered execution timed out.",
             failed_error_prefix="Recovered execution failed",
+            effort=effort,
         )
 
     def run_followup_execution(
@@ -734,6 +740,7 @@ class CodexRunner:
         project: ProjectInfo,
         model: str | None = None,
         provider: str = DEFAULT_TASK_PROVIDER,
+        effort: str | None = None,
     ) -> TaskRecord:
         provider = normalize_task_provider(provider)
         task.phase = "running"
@@ -770,6 +777,7 @@ class CodexRunner:
             success_phase="completed",
             timeout_error="Continuation timed out.",
             failed_error_prefix="Continuation failed",
+            effort=effort,
         )
 
     def run_force_push_agent(
@@ -821,6 +829,7 @@ class CodexRunner:
         round_number: int,
         model: str | None = None,
         provider: str = DEFAULT_TASK_PROVIDER,
+        effort: str | None = None,
     ) -> TaskRecord:
         provider = normalize_task_provider(provider)
         task.phase = "running"
@@ -851,6 +860,7 @@ class CodexRunner:
             success_phase="completed",
             timeout_error="Revision execution timed out.",
             failed_error_prefix="Revision execution failed",
+            effort=effort,
         )
 
     def run_agent_chat(
@@ -859,6 +869,7 @@ class CodexRunner:
         project: ProjectInfo,
         model: str | None = None,
         provider: str = DEFAULT_TASK_PROVIDER,
+        effort: str | None = None,
     ) -> TaskRecord:
         provider = normalize_task_provider(provider)
         task.phase = "agent_running"
@@ -889,4 +900,5 @@ class CodexRunner:
             success_phase="agent_completed",
             timeout_error="Agent response timed out.",
             failed_error_prefix="Agent response failed",
+            effort=effort,
         )

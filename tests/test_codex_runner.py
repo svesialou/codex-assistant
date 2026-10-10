@@ -187,8 +187,20 @@ class CodexRunnerTest(unittest.TestCase):
                 project_path="/tmp/demo",
                 output_path=Path(tmp) / "out.md",
                 session_id="019e7842-d41f-72b3-9394-911a9c490cb4",
+                effort="low",
+            )
+            claude_command = runner.executor_for("claude").build(
+                MODE_RESUME,
+                project_path="/tmp/demo",
+                output_path=Path(tmp) / "out.md",
+                model="haiku",
+                session_id="claude-session",
+                effort="low",
             )
 
+        self.assertIn('model_reasoning_effort="low"', command.argv)
+        self.assertEqual(claude_command.argv[claude_command.argv.index("--effort") + 1], "low")
+        self.assertEqual(claude_command.argv[claude_command.argv.index("--model") + 1], "haiku")
         self.assertEqual(command.argv[:3], ["codex", "exec", "resume"])
         self.assertIn('approval_policy="never"', command.argv)
         self.assertIn('sandbox_mode="danger-full-access"', command.argv)

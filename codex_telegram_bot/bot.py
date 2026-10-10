@@ -16,7 +16,7 @@ from typing import Any
 
 from .activity_status import extract_codex_activity, mask_secrets, render_codex_status
 from .agent_roles import AGENT_ROLES
-from .config import Config, normalize_task_provider
+from .config import DEFAULT_CLAUDE_VERIFY_COMMAND, Config, normalize_task_provider
 from .codex_runner import CodexRunner, extract_session_id
 from .stream_events import (
     SUBAGENT_COMPLETED,
@@ -53,7 +53,13 @@ from .services.executors import executor_agent_name, executor_display_name
 from .services.intent_router import IntentContext, IntentResult, IntentRouter
 from .services.llm_provider import ClaudeProvider
 from .services.model_router import ModelRouter, normalize_manual_tier, render_routing_decision
-from .services.orchestrator import OrchestratorService
+from .services.orchestrator import (
+    KIND_AGENT_CHAT,
+    KIND_EXECUTE,
+    KIND_FOLLOWUP,
+    KIND_RECOVER,
+    OrchestratorService,
+)
 from .services.project_aliases import (
     ProjectAliasStore,
     ProjectResolution,
@@ -65,6 +71,7 @@ from .services.project_memory import ProjectMemoryStore
 from .services.project_resolver import ProjectResolver
 from .services.redaction import RedactionService
 from .services.runtime_identity import render_runtime_identity, runtime_identity
+from .services.router_policy import RouterPolicy, render_router_stats, seed_from_history
 from .services.runtime_sync import compare_runtime_files, render_runtime_drift
 from .services.task_resolver import TaskResolver
 from .services.task_events import TaskEventLog, render_task_events
@@ -118,6 +125,7 @@ Commands:
 /remember <text> - propose a project memory note
 /memory [status|search|forget|summarize|export] - manage project memory
 /runtime - show source/runtime identity
+/router - show learned model routing stats
 
 Flow:
 1. Send a task as plain text, or use /run for custom direct execution.
@@ -143,6 +151,7 @@ BOT_COMMANDS = [
     {"command": "memory", "description": "Show project memory"},
     {"command": "remember", "description": "Save project memory note"},
     {"command": "debug", "description": "Toggle debug details"},
+    {"command": "router", "description": "Show learned model routing stats"},
     {"command": "help", "description": "Show help"},
 ]
 
@@ -634,7 +643,8 @@ class CodexTelegramBot:
         self.intent_router = IntentRouter()
         self.project_resolver = ProjectResolver(self.aliases)
         self.task_resolver = TaskResolver(self.store)
-        self.model_router = ModelRouter(config)
+        self.router_policy = RouterPolicy(config.state_dir / "router-stats.json")
+        self.model_router = ModelRouter(config, self.router_policy)
         self.orchestrator = OrchestratorService(
             config=config,
             store=self.store,
@@ -643,6 +653,13 @@ class CodexTelegramBot:
             claude_provider=ClaudeProvider(config),
             memory_engine=self.memory_engine,
             redactor=self.redactor,
+            policy=self.router_policy,
+            verify_provider=ClaudeProvider(
+                replace(
+                    config,
+                    claude_command=config.claude_command or DEFAULT_CLAUDE_VERIFY_COMMAND,
+                )
+            ),
         )
         self.projects: list[ProjectInfo] = []
         self.offset: int | None = None
@@ -1403,6 +1420,8 @@ class CodexTelegramBot:
             self.remember_command(chat_id, user_id, args)
         elif command == "/runtime":
             self.show_runtime_identity(chat_id)
+        elif command == "/router":
+            self.send(chat_id, render_router_stats(self.router_policy))
         else:
             self.send(chat_id, "Unknown command. Use /help.")
 
@@ -3259,7 +3278,16 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_agent_chat(task, project, provider=provider)
+        if self.config.router_learning:
+            task = self.orchestrator.run_routed(
+                task,
+                project,
+                KIND_AGENT_CHAT,
+                provider,
+                append_event=self.append_event,
+            )
+        else:
+            task = self.runner.run_agent_chat(task, project, provider=provider)
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
@@ -3692,6 +3720,19 @@ class CodexTelegramBot:
                     data,
                 ),
             )
+        elif self.config.router_learning:
+            task = self.orchestrator.run_routed(
+                task,
+                project,
+                KIND_RECOVER if recover else KIND_EXECUTE,
+                provider,
+                notify=lambda text: self.send(
+                    task.chat_id,
+                    text,
+                    reply_markup=running_task_keyboard(task.id),
+                ),
+                append_event=self.append_event,
+            )
         elif recover:
             task = self.runner.run_recovery_execution(task, project, provider=provider)
         else:
@@ -3773,7 +3814,21 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_followup_execution(task, project, provider=provider)
+        if self.config.router_learning:
+            task = self.orchestrator.run_routed(
+                task,
+                project,
+                KIND_FOLLOWUP,
+                provider,
+                notify=lambda text: self.send(
+                    task.chat_id,
+                    text,
+                    reply_markup=running_task_keyboard(task.id),
+                ),
+                append_event=self.append_event,
+            )
+        else:
+            task = self.runner.run_followup_execution(task, project, provider=provider)
         post_snapshot = self.record_git_safety_snapshot(task, "post-execution")
         if self.effective_memory_mode(task.chat_id):
             self.memory_engine.remember_completed_task(
@@ -4269,6 +4324,7 @@ class CodexTelegramBot:
     def run(self) -> None:
         self.load_or_build_index()
         self.configure_telegram_menu()
+        self.seed_router_stats()
         self.send_startup_message()
         self.recover_interrupted_tasks()
         self.resume_prompt_drafts()
@@ -4285,6 +4341,25 @@ class CodexTelegramBot:
             except Exception:
                 LOG.exception("polling failed")
                 time.sleep(5)
+
+    def seed_router_stats(self) -> None:
+        """Seed router stats once from task history, before any task runs.
+
+        Runs synchronously so live runs never race the session cost baseline.
+        """
+        if not self.config.router_learning or self.router_policy.exists():
+            return
+        try:
+            count = seed_from_history(
+                self.router_policy,
+                (task.to_dict() for task in self.store.tasks()),
+                lambda payload: self.model_router.classify(
+                    TaskRecord.from_dict(payload)
+                ).complexity,
+            )
+            LOG.info("router stats seeded from %s historical tasks", count)
+        except Exception:
+            LOG.exception("router stats seeding failed")
 
     def send_startup_message(self) -> None:
         text = (

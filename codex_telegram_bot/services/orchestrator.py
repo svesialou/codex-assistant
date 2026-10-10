@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
@@ -15,11 +16,25 @@ from .llm_provider import LlmProvider, LlmProviderUnavailable, LlmRequest
 from .model_router import (
     ModelRouter,
     RoutingDecision,
+    render_executor_choice,
     render_routing_decision,
     render_selected_flow,
 )
 from .project_memory_engine import ProjectMemoryEngine
 from .redaction import RedactionService
+from .router_policy import (
+    DEFAULT_CLAUDE_TIER_MODELS,
+    RouterPolicy,
+    RunUsage,
+    log_size,
+    parse_run_usage,
+)
+
+# Executor run kinds that go through the learning router outside orchestrator mode.
+KIND_EXECUTE = "execute"
+KIND_RECOVER = "recover"
+KIND_FOLLOWUP = "followup"
+KIND_AGENT_CHAT = "agent_chat"
 
 
 @dataclass(frozen=True)
@@ -114,6 +129,8 @@ class OrchestratorService:
         claude_provider: LlmProvider,
         memory_engine: ProjectMemoryEngine,
         redactor: RedactionService | None = None,
+        policy: RouterPolicy | None = None,
+        verify_provider: LlmProvider | None = None,
     ) -> None:
         self.config = config
         self.store = store
@@ -122,6 +139,206 @@ class OrchestratorService:
         self.claude_provider = claude_provider
         self.memory_engine = memory_engine
         self.redactor = redactor or RedactionService()
+        self.policy = policy
+        self.verify_provider = verify_provider or claude_provider
+
+    def run_routed(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        kind: str,
+        executor_provider: str,
+        notify: Callable[[str], None] | None = None,
+        append_event: Callable[..., None] | None = None,
+    ) -> TaskRecord:
+        """Router -> executor -> verify by risk -> escalate once -> learn.
+
+        Used for direct runs (orchestrator off, follow-ups, agent chat).
+        """
+        manual_tier = str(task.model_routing.get("manual_tier") or "auto")
+        decision = self.model_router.route(
+            task,
+            manual_tier=manual_tier,
+            executor_provider=executor_provider,
+        )
+        if kind == KIND_AGENT_CHAT:
+            # Read-only answers have no diff to review.
+            decision = replace(
+                decision,
+                classification=replace(decision.classification, estimated_risk="low"),
+                rule_tier="",
+            )
+        self._record_routing(task, decision, False)
+        choice = render_executor_choice(decision)
+        self._append_event(append_event, task.id, "ModelRouter", choice, decision.to_dict())
+        if notify is not None and kind != KIND_AGENT_CHAT:
+            notify(choice)
+
+        log_path = self._kind_log_path(task, kind)
+        offset, started = log_size(log_path), time.time()
+        task = self._run_kind(task, project, decision, kind)
+        if was_interrupted(task):
+            return task
+        passed, review = self._verify(task, project, decision, kind, allow_full=True)
+        feedback = (
+            review.follow_up_prompt_for_codex.strip()
+            if review is not None and review.verdict == "request_changes"
+            else ""
+        )
+        retry = None
+        if not passed:
+            retry = self.model_router.escalate(decision) if retryable(task, review) else None
+            if retry is None and feedback:
+                retry = decision
+        if not passed and review is not None and notify is not None:
+            notify(f"Verify full: {review.verdict}. {review.review_summary[:400]}".strip())
+        if retry is not None:
+            self._learn(task, decision, False, self._usage(log_path, offset), started)
+            if notify is not None:
+                notify(f"Escalate: {render_executor_choice(retry)}")
+            self._append_event(
+                append_event,
+                task.id,
+                "ModelRouter",
+                f"Verify failed, retrying: {render_executor_choice(retry)}",
+                retry.to_dict(),
+            )
+            self._record_routing(task, retry, False)
+            decision = retry
+            offset, started = log_size(log_path), time.time()
+            task = self._retry_kind(task, project, decision, kind, feedback)
+            if was_interrupted(task):
+                return task
+            passed, _ = self._verify(task, project, decision, kind, allow_full=False)
+        self._save_trace(
+            task,
+            decision,
+            codex_summary=read_final(task),
+            review=review,
+            final_status="done" if passed else "failed",
+            learn_success=passed,
+            usage_offset=offset,
+            started_at=started,
+        )
+        return task
+
+    def _kind_log_path(self, task: TaskRecord, kind: str) -> Path:
+        name = "agent.log" if kind == KIND_AGENT_CHAT else "run.log"
+        return self.store.task_dir(task.id) / name
+
+    def _run_kind(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        decision: RoutingDecision,
+        kind: str,
+    ) -> TaskRecord:
+        options = {
+            "model": decision.selected_models.get("executor"),
+            "provider": decision.executor_provider,
+            "effort": decision.effort or None,
+        }
+        if kind == KIND_AGENT_CHAT:
+            return self.runner.run_agent_chat(task, project, **options)
+        if kind == KIND_FOLLOWUP:
+            return self.runner.run_followup_execution(task, project, **options)
+        if kind == KIND_RECOVER:
+            return self.runner.run_recovery_execution(task, project, **options)
+        return self.runner.run_execution(task, project, **options)
+
+    def _retry_kind(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        decision: RoutingDecision,
+        kind: str,
+        feedback: str,
+    ) -> TaskRecord:
+        options = {
+            "model": decision.selected_models.get("executor"),
+            "provider": decision.executor_provider,
+            "effort": decision.effort or None,
+        }
+        if kind == KIND_AGENT_CHAT:
+            return self.runner.run_agent_chat(task, project, **options)
+        if feedback:
+            task.prepared_codex_prompt = feedback
+            self.store.save_task(task)
+            return self.runner.run_revision_execution(task, project, 1, **options)
+        # Continue from the workspace state the failed attempt left behind.
+        return self.runner.run_recovery_execution(task, project, **options)
+
+    def _verify(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        decision: RoutingDecision,
+        kind: str,
+        allow_full: bool,
+    ) -> tuple[bool, ReviewResult | None]:
+        success_phase = "agent_completed" if kind == KIND_AGENT_CHAT else "completed"
+        if task.phase != success_phase or not read_final(task):
+            return False, None
+        if not allow_full or decision.verify_mode != "full":
+            return True, None
+        try:
+            review = self._run_verify_review(task, project, decision)
+        except LlmProviderUnavailable:
+            # Verify must not block delivery; the light check already passed.
+            return True, None
+        return review.verdict == "approve", review
+
+    def _run_verify_review(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        decision: RoutingDecision,
+    ) -> ReviewResult:
+        model = (
+            decision.selected_models.get("reviewer")
+            or self.config.models.claude.for_tier("standard")
+            or DEFAULT_CLAUDE_TIER_MODELS["standard"]
+        )
+        prompt = reviewer_prompt(
+            task,
+            None,
+            read_final(task),
+            read_git_diff(project.path),
+            self.memory_engine.build_context_pack(task).render(),
+        )
+        redacted = self.redactor.redact_text(prompt, max_chars=60000)
+        response = self.verify_provider.complete(
+            LlmRequest(
+                role="reviewer",
+                prompt=redacted.text,
+                model=model,
+                max_tokens=self.config.claude_max_tokens,
+            )
+        )
+        return ReviewResult.from_text(response.text)
+
+    def _usage(self, log_path: Path | str | None, offset: int) -> RunUsage:
+        usage = parse_run_usage(log_path, offset)
+        return self.policy.price(usage) if self.policy is not None else usage
+
+    def _learn(
+        self,
+        task: TaskRecord,
+        decision: RoutingDecision,
+        success: bool,
+        usage: RunUsage,
+        started_at: float,
+    ) -> None:
+        if self.policy is None or not self.config.router_learning:
+            return
+        self.policy.record(
+            decision.classification.complexity,
+            task.project_slug,
+            decision.classification.recommended_codex_tier,
+            success,
+            usage=usage,
+            duration_seconds=time.time() - started_at if started_at else 0.0,
+        )
 
     def execute(
         self,
@@ -193,7 +410,17 @@ class OrchestratorService:
                 f"Cheap path selected: {executor_name}-only flow.",
                 None,
             )
-            return self._run_executor(task, project, decision, recover=recover)
+            task, decision = self._run_executor_escalating(
+                task, project, decision, recover, notify
+            )
+            self._save_trace(
+                task,
+                decision,
+                codex_summary=read_final(task),
+                final_status="done" if task.phase == "completed" else "failed",
+                learn_success=executor_succeeded(task),
+            )
+            return task
 
         if not self._claude_orchestrator_available(decision):
             if self.config.orchestrator_strict_mode or not self.config.orchestrator_fallback_to_codex:
@@ -213,12 +440,15 @@ class OrchestratorService:
                 executor_name = executor_display_name(decision.executor_provider)
                 notify(f"Claude architect/reviewer недоступен. Запускаю {executor_name}-only flow.")
             decision = self._without_claude_roles_decision(task, decision)
-            task = self._run_executor(task, project, decision, recover=recover)
+            task, decision = self._run_executor_escalating(
+                task, project, decision, recover, notify
+            )
             self._save_trace(
                 task,
                 decision,
                 codex_summary=read_final(task),
                 final_status="done" if task.phase == "completed" else "failed",
+                learn_success=executor_succeeded(task),
             )
             return task
 
@@ -261,7 +491,7 @@ class OrchestratorService:
             if notify is not None:
                 notify("Claude architect: составил план.")
 
-        task = self._run_executor(task, project, decision, recover=recover)
+        task, decision = self._run_executor_escalating(task, project, decision, recover, notify)
         if notify is not None:
             executor_name = executor_display_name(decision.executor_provider)
             notify(f"{executor_name}: завершил реализацию." if task.phase == "completed" else f"{executor_name}: выполнение завершилось ошибкой.")
@@ -272,6 +502,7 @@ class OrchestratorService:
                 architect_plan=architect_plan,
                 codex_summary=read_final(task),
                 final_status="done" if task.phase == "completed" else "failed",
+                learn_success=executor_succeeded(task),
             )
             return task
 
@@ -304,6 +535,7 @@ class OrchestratorService:
                     codex_summary=read_final(task),
                     review=review,
                     final_status="done",
+                    learn_success=task.orchestrator_review_rounds == 0,
                 )
                 return task
 
@@ -318,6 +550,7 @@ class OrchestratorService:
                     codex_summary=read_final(task),
                     review=review,
                     final_status="needs_human",
+                    learn_success=False,
                 )
                 return task
 
@@ -335,6 +568,7 @@ class OrchestratorService:
                     codex_summary=read_final(task),
                     review=review,
                     final_status="needs_human",
+                    learn_success=False,
                 )
                 return task
 
@@ -355,6 +589,7 @@ class OrchestratorService:
                 review_round,
                 model=decision.selected_models.get("executor"),
                 provider=decision.executor_provider,
+                effort=decision.effort or None,
             )
 
         return task
@@ -378,19 +613,45 @@ class OrchestratorService:
         recover: bool = False,
     ) -> TaskRecord:
         model = decision.selected_models.get("executor")
+        effort = decision.effort or None
         if recover:
             return self.runner.run_recovery_execution(
                 task,
                 project,
                 model=model,
                 provider=decision.executor_provider,
+                effort=effort,
             )
         return self.runner.run_execution(
             task,
             project,
             model=model,
             provider=decision.executor_provider,
+            effort=effort,
         )
+
+    def _run_executor_escalating(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        decision: RoutingDecision,
+        recover: bool,
+        notify: Callable[[str], None] | None,
+    ) -> tuple[TaskRecord, RoutingDecision]:
+        """Run the executor and escalate one tier once when it fails outright."""
+        log_path = self._kind_log_path(task, KIND_EXECUTE)
+        offset, started = log_size(log_path), time.time()
+        task = self._run_executor(task, project, decision, recover=recover)
+        if was_interrupted(task) or executor_succeeded(task) or not retryable(task, None):
+            return task, decision
+        retry = self.model_router.escalate(decision)
+        if retry is None:
+            return task, decision
+        self._learn(task, decision, False, self._usage(log_path, offset), started)
+        if notify is not None:
+            notify(f"Escalate: {render_executor_choice(retry)}")
+        self._record_routing(task, retry, task.orchestrator_enabled)
+        return self._run_executor(task, project, retry, recover=True), retry
 
     def _executor_available(self, decision: RoutingDecision) -> bool:
         return not self.runner.provider_unavailable_reason(decision.executor_provider)
@@ -516,6 +777,7 @@ class OrchestratorService:
             fallback,
             codex_summary=read_final(task),
             final_status="done" if task.phase == "completed" else "failed",
+            learn_success=executor_succeeded(task),
         )
         return task
 
@@ -527,7 +789,14 @@ class OrchestratorService:
         codex_summary: str = "",
         review: ReviewResult | None = None,
         final_status: str = "done",
+        learn_success: bool | None = None,
+        usage_offset: int = 0,
+        started_at: float = 0.0,
     ) -> None:
+        """Persist trace.json; learn from the run when `learn_success` is set."""
+        usage = self._usage(task.run_log_path, usage_offset)
+        if learn_success is not None and not was_interrupted(task):
+            self._learn(task, decision, learn_success, usage, started_at)
         payload = {
             "task_id": task.id,
             "created_at": now_iso(),
@@ -537,10 +806,14 @@ class OrchestratorService:
             "selected_models": decision.selected_models,
             "routing_reason": decision.routing_reason,
             "estimated_tokens": decision.estimated_tokens,
-            "actual_input_tokens": 0,
-            "actual_output_tokens": 0,
+            "actual_tokens": usage.tokens,
             "estimated_cost": None,
-            "actual_cost": None,
+            "actual_cost": usage.cost_usd,
+            "selected_tier": decision.classification.recommended_codex_tier,
+            "effort": decision.effort,
+            "verify": decision.verify_mode,
+            "policy_source": decision.policy_source,
+            "policy_reason": decision.policy_reason,
             "escalations": decision.escalations,
             "downgrades": decision.downgrades,
             "architect_model": decision.selected_models.get("architect"),
@@ -674,6 +947,27 @@ def render_architect_plan(plan: ArchitectPlan | None) -> str:
         lines.append("Optional questions:")
         lines.extend(f"- {item}" for item in plan.optional_questions)
     return "\n".join(lines)
+
+
+def was_interrupted(task: TaskRecord) -> bool:
+    """Killed by a signal: user cancel or bot shutdown, not a model outcome."""
+    return task.returncode is not None and task.returncode < 0
+
+
+def executor_succeeded(task: TaskRecord) -> bool:
+    return task.phase in {"completed", "agent_completed"} and bool(read_final(task))
+
+
+def retryable(task: TaskRecord, review: ReviewResult | None) -> bool:
+    """A stronger tier may help: requested changes, model error or empty answer.
+
+    Timeouts (no return code) are not retried: a stronger tier is slower.
+    """
+    if review is not None:
+        return review.verdict == "request_changes"
+    if task.returncode is None:
+        return False
+    return task.returncode > 0 or task.phase in {"completed", "agent_completed"}
 
 
 def read_final(task: TaskRecord) -> str:

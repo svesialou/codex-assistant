@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from ..config import Config, normalize_task_provider
 from ..task_store import TaskRecord
+from .router_policy import (
+    DEFAULT_CLAUDE_TIER_MODELS,
+    TIER_EFFORT,
+    RouterPolicy,
+    next_tier,
+)
 
 
 COMPLEXITIES = ("trivial", "small", "medium", "large", "critical")
@@ -65,18 +71,36 @@ class RoutingDecision:
     escalations: list[str] = field(default_factory=list)
     downgrades: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    effort: str = ""
+    policy_source: str = "rule"
+    policy_reason: str = ""
+    # Tier the regex rule recommended before the learned policy moved it.
+    rule_tier: str = ""
+
+    @property
+    def verify_mode(self) -> str:
+        if self.classification.estimated_risk == "high":
+            return "full"
+        tier = self.classification.recommended_codex_tier
+        if self.rule_tier and TIER_RANK[tier] < TIER_RANK[self.rule_tier]:
+            # A cheaper tier than the rule must prove itself on reviewed runs,
+            # otherwise exit-code-only successes would teach blind downgrades.
+            return "full"
+        return "light"
 
     def to_dict(self) -> dict[str, Any]:
         payload = asdict(self)
         payload["complexity"] = self.classification.complexity
         payload["selected_tier"] = self.classification.recommended_codex_tier
         payload["executor_provider"] = self.executor_provider
+        payload["verify"] = self.verify_mode
         return payload
 
 
 class ModelRouter:
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, policy: RouterPolicy | None = None) -> None:
         self.config = config
+        self.policy = policy
 
     def classify(self, task: TaskRecord) -> TaskClassification:
         text = " ".join(
@@ -192,6 +216,9 @@ class ModelRouter:
         warnings: list[str] = []
         escalations: list[str] = []
         downgrades: list[str] = []
+        policy_source = "manual" if tier != "auto" else "rule"
+        policy_reason = ""
+        rule_tier = ""
 
         selected_codex_tier = classification.recommended_codex_tier
         if tier != "auto":
@@ -212,6 +239,18 @@ class ModelRouter:
             routed = replace_complexity(routed, "small", "standard")
             escalations.append("attachments make trivial task small")
 
+        if tier == "auto" and self.policy is not None and self.config.router_learning:
+            rule_tier = routed.recommended_codex_tier
+            choice = self.policy.choose(
+                routed.complexity,
+                task.project_slug,
+                routed.recommended_codex_tier,
+                self.auto_tier_ceiling(),
+            )
+            routed = replace_codex_tier(routed, choice.tier)
+            policy_source = choice.source
+            policy_reason = choice.reason
+
         if routed.recommended_codex_tier == "max":
             if not self.config.orchestrator_budget.allow_max_tier:
                 routed = replace_codex_tier(routed, "strong")
@@ -219,11 +258,7 @@ class ModelRouter:
             elif self.config.orchestrator_require_confirm_for_max:
                 warnings.append("max tier requires user confirmation")
 
-        executor_model = (
-            self.config.models.claude.for_tier(routed.recommended_codex_tier)
-            if provider == "claude"
-            else self.config.models.codex.for_tier(routed.recommended_codex_tier)
-        )
+        executor_model = self.executor_model(provider, routed.recommended_codex_tier)
         selected_models = {
             "classifier": self.config.models.claude.for_tier("cheap"),
             "architect": self.config.models.claude.for_tier(
@@ -254,6 +289,57 @@ class ModelRouter:
             escalations=escalations,
             downgrades=downgrades,
             warnings=warnings,
+            effort=(
+                TIER_EFFORT.get(routed.recommended_codex_tier, "")
+                if self.config.router_learning
+                else ""
+            ),
+            policy_source=policy_source,
+            policy_reason=policy_reason,
+            rule_tier=rule_tier,
+        )
+
+    def executor_model(self, provider: str, tier: str) -> str | None:
+        if provider == "claude":
+            configured = self.config.models.claude.for_tier(tier)
+            if configured or not self.config.router_learning:
+                return configured
+            return DEFAULT_CLAUDE_TIER_MODELS.get(tier)
+        return self.config.models.codex.for_tier(tier)
+
+    def auto_tier_ceiling(self) -> str:
+        ceiling = self.config.orchestrator_max_auto_tier
+        if ceiling == "max" and (
+            self.config.orchestrator_require_confirm_for_max
+            or not self.config.orchestrator_budget.allow_max_tier
+        ):
+            return "strong"
+        return ceiling
+
+    def escalate(self, decision: RoutingDecision) -> RoutingDecision | None:
+        """Next executor tier after a failed verify, or None at the ceiling."""
+        current = decision.classification.recommended_codex_tier
+        if (
+            decision.manual_tier != "auto"
+            or not self.config.router_learning
+            or not self.config.router_auto_escalate
+        ):
+            return None
+        target = next_tier(current, self.auto_tier_ceiling())
+        if target is None:
+            return None
+        classification = replace_codex_tier(decision.classification, target)
+        selected_models = dict(decision.selected_models)
+        selected_models["executor"] = self.executor_model(decision.executor_provider, target)
+        return replace(
+            decision,
+            classification=classification,
+            selected_flow=render_selected_flow(classification, decision.executor_provider),
+            selected_models=selected_models,
+            effort=TIER_EFFORT[target],
+            escalations=[*decision.escalations, f"verify failed: {current} -> {target}"],
+            policy_source="escalate",
+            policy_reason=f"{current} failed verify",
         )
 
     def evaluate_post_run(
@@ -331,8 +417,21 @@ def render_routing_decision(decision: RoutingDecision) -> str:
         f"- executor provider: {decision.executor_provider}",
         f"- reason: {decision.routing_reason}",
     ]
+    lines.append(f"- {render_executor_choice(decision)}")
     if decision.manual_tier != "auto":
         lines.append(f"- manual tier: {decision.manual_tier}")
     for warning in decision.warnings:
         lines.append(f"- warning: {warning}")
     return "\n".join(lines)
+
+
+def render_executor_choice(decision: RoutingDecision) -> str:
+    model = decision.selected_models.get("executor") or "default"
+    tier = decision.classification.recommended_codex_tier
+    source = decision.policy_source
+    if decision.policy_reason:
+        source = f"{source}: {decision.policy_reason}"
+    return (
+        f"router: {model} ({tier}) · effort {decision.effort or '-'} · "
+        f"verify {decision.verify_mode} · {source}"
+    )
