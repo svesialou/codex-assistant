@@ -124,6 +124,9 @@ DEFAULT_CLAUDE_EXEC_COMMAND = (
 DEFAULT_CLAUDE_READONLY_COMMAND = (
     "claude -p --output-format stream-json --verbose --permission-mode plan"
 )
+# Read-only reviewer transport for router "full" verify when CODEX_CLAUDE_CMD
+# is not configured.
+DEFAULT_CLAUDE_VERIFY_COMMAND = "claude -p --permission-mode plan --model {model}"
 
 
 def normalize_task_provider(
@@ -232,6 +235,8 @@ class Config:
     orchestrator_default_tier: str = "cheap"
     orchestrator_max_auto_tier: str = "strong"
     orchestrator_require_confirm_for_max: bool = True
+    router_learning: bool = True
+    router_auto_escalate: bool = True
     task_provider: str = DEFAULT_TASK_PROVIDER
     claude_enabled: bool = True
     claude_command: str | None = None
@@ -396,6 +401,8 @@ class Config:
                 env.get("CODEX_ORCHESTRATOR_REQUIRE_CONFIRM_FOR_MAX"),
                 True,
             ),
+            router_learning=parse_bool(env.get("CODEX_ROUTER_LEARNING"), True),
+            router_auto_escalate=parse_bool(env.get("CODEX_ROUTER_AUTO_ESCALATE"), True),
             task_provider=normalize_task_provider(
                 env.get("CODEX_TELEGRAM_TASK_PROVIDER")
                 or env.get("CODEX_TASK_PROVIDER"),

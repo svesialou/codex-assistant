@@ -248,7 +248,33 @@ CODEX_CHEAP_MODEL=
 CODEX_STANDARD_MODEL=
 CODEX_STRONG_MODEL=
 CODEX_MAX_MODEL=
+CODEX_ROUTER_LEARNING=1        # learning router for every executor run
+CODEX_ROUTER_AUTO_ESCALATE=1   # retry one tier higher when verify fails
 ```
+
+### Learning model router
+
+With `CODEX_ROUTER_LEARNING=1` (default) every task, follow-up, and agent chat
+goes through the router, also when orchestrator mode is off:
+
+1. The regex `ModelRouter` classifies complexity and proposes a tier.
+2. `RouterPolicy` picks the executor tier and effort
+   (`cheap`/low, `standard`/medium, `strong`/high). It switches to a
+   cheaper tier only after it is proven (≥5 runs, ≥80% smoothed success),
+   skips tiers that keep failing, and explores one tier cheaper ~10% of the time.
+   `large` never drops below `standard`, `critical` never below `strong`.
+3. Verify by risk: `light` checks the exit code and a non-empty answer;
+   `full` adds a read-only Claude review of the diff for high-risk work and
+   for any run on a tier cheaper than the rule proposed.
+4. On fail the run is retried once on the next tier, up to
+   `CODEX_ORCHESTRATOR_MAX_AUTO_TIER` (`max` only when confirmation is off).
+5. Every outcome, with tokens and cost parsed from the run log, is stored in
+   `~/.codex/telegram-bot/router-stats.json`. On first start, task history is
+   seeded as the `strong` baseline. `/router` shows the stats and savings.
+
+Without `CLAUDE_*_MODEL` the Claude executor uses the CLI aliases `haiku`,
+`sonnet`, and `opus` per tier. Full verify uses `CODEX_CLAUDE_CMD` when set,
+otherwise `claude -p --permission-mode plan --model sonnet`.
 
 ### Executor providers
 
@@ -376,6 +402,7 @@ contents into chat or logs.
 /processes
 /logs <task_id>
 /memory status|search|forget|summarize|export
+/router
 ```
 
 ## Execution Flow

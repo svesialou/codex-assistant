@@ -68,6 +68,7 @@ class Executor:
         output_path: Path,
         model: str | None = None,
         session_id: str = "",
+        effort: str | None = None,
     ) -> ExecutorCommand:
         raise NotImplementedError
 
@@ -112,6 +113,9 @@ class CodexExecutor(Executor):
             argv.extend(["-m", model])
         return argv
 
+    def _effort_args(self, effort: str | None) -> list[str]:
+        return ["-c", f'model_reasoning_effort="{effort}"'] if effort else []
+
     def build(
         self,
         mode: str,
@@ -120,6 +124,7 @@ class CodexExecutor(Executor):
         output_path: Path,
         model: str | None = None,
         session_id: str = "",
+        effort: str | None = None,
     ) -> ExecutorCommand:
         selected_model = model or self.config.model
 
@@ -140,10 +145,12 @@ class CodexExecutor(Executor):
             ]
             if selected_model:
                 argv.extend(["-m", selected_model])
+            argv.extend(self._effort_args(effort))
             argv.extend([session_id, "-"])
             return ExecutorCommand(argv=argv, session_id=session_id)
 
         argv = self._base_argv(project_path, output_path, selected_model)
+        argv.extend(self._effort_args(effort))
         if mode == MODE_FORCE_PUSH:
             argv.extend(["--dangerously-bypass-approvals-and-sandbox", "--ignore-rules", "-"])
         elif mode == MODE_PLAN:
@@ -198,6 +205,7 @@ class ClaudeExecutor(Executor):
         output_path: Path,
         model: str | None = None,
         session_id: str = "",
+        effort: str | None = None,
     ) -> ExecutorCommand:
         del project_path, output_path  # Claude runs in cwd and prints to stdout.
         if mode not in MODES:
@@ -209,6 +217,8 @@ class ClaudeExecutor(Executor):
             raise ValueError("Claude executor command is empty.")
         if selected_model and not has_model_placeholder:
             argv.extend(["--model", selected_model])
+        if effort and "--effort" not in argv:
+            argv.extend(["--effort", effort])
         stream_json = uses_stream_json(argv)
         if stream_json and "--verbose" not in argv:
             # Claude rejects stream-json in print mode without --verbose.
