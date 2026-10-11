@@ -10,7 +10,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -67,9 +67,22 @@ from .services.project_aliases import (
     render_resolution_error,
 )
 from .services.project_memory_engine import ProjectMemoryEngine
+from .services.obsidian import (
+    BACKFILL_PHASES,
+    ObsidianVault,
+    append_hub_entry,
+    backfill_vault,
+    refresh_project_memory,
+    task_note_name,
+    task_project_slugs,
+    task_title,
+    write_index,
+    write_task_note,
+)
 from .services.project_memory import ProjectMemoryStore
 from .services.project_resolver import ProjectResolver
 from .services.redaction import RedactionService
+from .services.session_index import collect_relations, collect_session_lines, scan_sessions
 from .services.runtime_identity import render_runtime_identity, runtime_identity
 from .services.router_policy import RouterPolicy, render_router_stats, seed_from_history
 from .services.runtime_sync import compare_runtime_files, render_runtime_drift
@@ -126,6 +139,8 @@ Commands:
 /memory [status|search|forget|summarize|export] - manage project memory
 /runtime - show source/runtime identity
 /router - show learned model routing stats
+/note <text> - append a note to today's Obsidian daily note
+/obsidian status|search <query> - check or search the Obsidian vault
 
 Flow:
 1. Send a task as plain text, or use /run for custom direct execution.
@@ -152,6 +167,8 @@ BOT_COMMANDS = [
     {"command": "remember", "description": "Save project memory note"},
     {"command": "debug", "description": "Toggle debug details"},
     {"command": "router", "description": "Show learned model routing stats"},
+    {"command": "note", "description": "Append a note to today's Obsidian daily note"},
+    {"command": "obsidian", "description": "Search or check the Obsidian vault"},
     {"command": "help", "description": "Show help"},
 ]
 
@@ -633,6 +650,7 @@ class CodexTelegramBot:
         self.aliases = ProjectAliasStore(config.index_dir)
         self.events = TaskEventLog(self.store)
         self.memory = ProjectMemoryStore(config.index_dir, config.state_dir)
+        self.obsidian = ObsidianVault(config.obsidian_vault_dir)
         self.redactor = RedactionService()
         self.memory_engine = ProjectMemoryEngine(
             config,
@@ -1422,6 +1440,10 @@ class CodexTelegramBot:
             self.show_runtime_identity(chat_id)
         elif command == "/router":
             self.send(chat_id, render_router_stats(self.router_policy))
+        elif command == "/note":
+            self.obsidian_note_command(chat_id, args)
+        elif command == "/obsidian":
+            self.obsidian_command(chat_id, args)
         else:
             self.send(chat_id, "Unknown command. Use /help.")
 
@@ -1743,6 +1765,53 @@ class CodexTelegramBot:
             self.send(chat_id, f"Alias saved: {alias} → {result.project.slug}")
             return
         self.send(chat_id, "Usage: /alias list | /alias add <alias> <project> | /alias remove <alias>")
+
+    def remember_task_in_obsidian(self, task: TaskRecord, final_text: str) -> None:
+        if task.phase not in BACKFILL_PHASES or not self.obsidian.is_ready():
+            return
+        try:
+            write_task_note(self.obsidian, task, final_text, self.redactor)
+            for slug in task_project_slugs(task):
+                append_hub_entry(self.obsidian, task, self.redactor, slug)
+                memory_text = self.memory.read_project_memory(slug, max_chars=10**9)
+                refresh_project_memory(self.obsidian, slug, self.redactor.redact_text(memory_text).text)
+            title = task_title(task, self.redactor)
+            self.obsidian.append_note(
+                f"[[{task_note_name(task)}|{task.id}]] {title}", datetime.now()
+            )
+        except OSError:
+            LOG.exception("failed to write task note to obsidian vault")
+
+    def obsidian_note_command(self, chat_id: int, args: str) -> None:
+        if not self.obsidian.is_ready():
+            self.send(chat_id, "Obsidian vault is not configured. Set CODEX_OBSIDIAN_VAULT_DIR.")
+            return
+        if not args.strip():
+            self.send(chat_id, "Usage: /note <text>")
+            return
+        path = self.obsidian.append_note(args, datetime.now())
+        self.send(chat_id, f"Saved to Obsidian: {path.relative_to(self.obsidian.root)}")
+
+    def obsidian_command(self, chat_id: int, args: str) -> None:
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower() if parts else "status"
+        rest = parts[1] if len(parts) > 1 else ""
+        if action == "status":
+            state = "ready" if self.obsidian.is_ready() else "not configured or missing"
+            self.send(chat_id, f"Obsidian vault: {state}\nPath: {self.obsidian.root or '-'}")
+            return
+        if action == "search":
+            if not rest.strip():
+                self.send(chat_id, "Usage: /obsidian search <query>")
+                return
+            if not self.obsidian.is_ready():
+                self.send(chat_id, "Obsidian vault is not configured. Set CODEX_OBSIDIAN_VAULT_DIR.")
+                return
+            matches = self.obsidian.search(rest)
+            lines = [f"{match.path}:{match.line_number} {match.line}" for match in matches]
+            self.send(chat_id, "Obsidian search:\n" + ("\n".join(lines) if lines else "-"))
+            return
+        self.send(chat_id, "Usage: /obsidian status | /obsidian search <query>")
 
     def show_memory(self, chat_id: int, project_slug: str | None = None) -> None:
         project = self.current_project(chat_id) if project_slug is None else self.find_project(project_slug)
@@ -3288,6 +3357,7 @@ class CodexTelegramBot:
             )
         else:
             task = self.runner.run_agent_chat(task, project, provider=provider)
+        self.remember_task_in_obsidian(task, read_task_final(task))
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = ""
@@ -3744,6 +3814,7 @@ class CodexTelegramBot:
                 final_text=read_task_final(task),
                 snapshot=post_snapshot,
             )
+        self.remember_task_in_obsidian(task, read_task_final(task))
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = read_task_final(task)
@@ -3836,6 +3907,7 @@ class CodexTelegramBot:
                 final_text=read_task_final(task),
                 snapshot=post_snapshot,
             )
+        self.remember_task_in_obsidian(task, read_task_final(task))
         self.remember_task_context(task, "status")
         self.finish_codex_status(status, task)
         final = read_task_final(task)
@@ -4384,6 +4456,11 @@ def parse_args() -> argparse.Namespace:
         help="Rebuild project index and exit.",
     )
     parser.add_argument(
+        "--obsidian-backfill",
+        action="store_true",
+        help="Write full notes for all past tasks and project memory into the Obsidian vault and exit.",
+    )
+    parser.add_argument(
         "--daily-summary",
         action="store_true",
         help="Send the previous workday activity summary and exit.",
@@ -4423,6 +4500,36 @@ def main() -> int:
             config.workspace_root,
         )
         print(f"Indexed {len(projects)} projects into {config.index_dir}")
+        return 0
+
+    if args.obsidian_backfill:
+        vault = ObsidianVault(config.obsidian_vault_dir)
+        if not vault.is_ready():
+            print("Obsidian vault is not configured. Set CODEX_OBSIDIAN_VAULT_DIR.", file=sys.stderr)
+            return 1
+        memory = ProjectMemoryStore(config.index_dir, config.state_dir)
+        all_tasks = TaskStore(config.state_dir).tasks()
+        known_session_ids = {
+            value for task in all_tasks for value in (task.codex_session_id, task.claude_session_id) if value
+        }
+        project_paths = [(project.slug, project.path) for project in load_index(config.index_dir)]
+        session_refs = scan_sessions(
+            Path("~/.codex/sessions").expanduser(),
+            Path("~/.claude/projects").expanduser(),
+            project_paths,
+        )
+        session_lines = collect_session_lines(session_refs, project_paths, known_session_ids, RedactionService())
+        relations = collect_relations(session_refs, project_paths, known_session_ids)
+        tasks, projects = backfill_vault(
+            vault,
+            all_tasks,
+            read_task_final,
+            lambda slug: memory.read_project_memory(slug, max_chars=10**9),
+            session_lines=session_lines,
+            relations=relations,
+        )
+        write_index(vault)
+        print(f"Wrote {tasks} task notes and {projects} project notes into {vault.root}")
         return 0
 
     config.validate_for_bot()

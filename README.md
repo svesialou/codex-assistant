@@ -403,7 +403,34 @@ contents into chat or logs.
 /logs <task_id>
 /memory status|search|forget|summarize|export
 /router
+/note <text>
+/obsidian status|search <query>
 ```
+
+### Obsidian
+
+Set the vault directory in `~/.codex/secrets/telegram.env`:
+
+```sh
+CODEX_OBSIDIAN_VAULT_DIR=/home/your-user/Obsidian/MyVault
+```
+
+`/note <text>` appends a timestamped line to `Daily/YYYY-MM-DD.md` in the vault.
+Every completed task automatically gets a full, untruncated note in
+`Tasks/<project>/<task_id>.md` (request, plan, result, diff summary, files), a link
+in `Projects/<project>.md` and a one-line link in the daily note. Every agent run
+receives the vault path as context. No manual command is needed. Secrets are
+redacted before writing.
+
+To build the vault from all past tasks and project memory (idempotent, safe to rerun):
+
+```sh
+python3 -m codex_telegram_bot --obsidian-backfill
+```
+`/obsidian search <query>` does a case-insensitive line search over `*.md` files,
+skipping `.obsidian`, `.trash` and `.git`. The feature is off when the variable is
+unset. The vault must be readable and writable by the bot user; with the Docker
+runtime it must be mounted into the container.
 
 ## Execution Flow
 
