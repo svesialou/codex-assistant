@@ -715,7 +715,9 @@ class OrchestratorService:
         project: ProjectInfo,
         decision: RoutingDecision,
     ) -> ArchitectPlan:
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         context_pack = self.memory_engine.build_context_pack(task).render()
         prompt = architect_prompt(task, context, context_pack)
         redacted = self.redactor.redact_text(prompt, max_chars=50000)

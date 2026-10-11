@@ -108,6 +108,12 @@ def parse_path_list(value: str | None, default: Iterable[Path]) -> list[Path]:
     ]
 
 
+def parse_optional_path(value: str | None) -> Path | None:
+    if value is None or value.strip() == "":
+        return None
+    return Path(os.path.expandvars(value.strip())).expanduser()
+
+
 def normalize_tier(value: str | None, default: str = "auto") -> str:
     tier = (value or default).strip().lower()
     if tier not in {"auto", "cheap", "standard", "strong", "max"}:
@@ -251,6 +257,7 @@ class Config:
     memory_max_items_per_project_context: int = 12
     memory_max_similar_tasks: int = 5
     memory_redact_secrets: bool = True
+    obsidian_vault_dir: Path | None = None
     models: ModelConfig = field(default_factory=ModelConfig)
     orchestrator_budget: OrchestratorBudgetConfig = field(
         default_factory=OrchestratorBudgetConfig
@@ -455,6 +462,7 @@ class Config:
                 int(env.get("CODEX_MEMORY_MAX_SIMILAR_TASKS", "5")),
             ),
             memory_redact_secrets=parse_bool(env.get("CODEX_MEMORY_REDACT_SECRETS"), True),
+            obsidian_vault_dir=parse_optional_path(env.get("CODEX_OBSIDIAN_VAULT_DIR")),
             models=ModelConfig(claude=claude_models, codex=codex_models),
             orchestrator_budget=OrchestratorBudgetConfig(
                 enabled=parse_bool(env.get("CODEX_ORCHESTRATOR_BUDGET_ENABLED"), True),

@@ -18,6 +18,7 @@ from .services.executors import (
     build_executors,
     resolve_executor,
 )
+from .services.obsidian import obsidian_agent_context
 from .stream_events import StreamTracker
 from .task_store import TaskRecord, TaskStore, process_start_time
 
@@ -48,6 +49,20 @@ def read_task_context(
     task: TaskRecord,
     primary_project: ProjectInfo,
     max_chars: int = 20000,
+    vault_dir: Path | None = None,
+) -> str:
+    context = _project_task_context(index_dir, task, primary_project, max_chars)
+    vault_context = obsidian_agent_context(vault_dir, primary_project.slug)
+    if not vault_context:
+        return context
+    return f"{context.rstrip()}\n\n{vault_context}\n"
+
+
+def _project_task_context(
+    index_dir: Path,
+    task: TaskRecord,
+    primary_project: ProjectInfo,
+    max_chars: int,
 ) -> str:
     slugs = task_context_slugs(task, primary_project.slug)
     if len(slugs) == 1:
@@ -615,7 +630,9 @@ class CodexRunner:
         task.plan_log_path = str(log_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(planning_prompt(task, context), encoding="utf-8")
 
         task = self._run_provider(
@@ -663,7 +680,9 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
         return self._run_provider(
@@ -708,7 +727,9 @@ class CodexRunner:
             task.codex_session_id = extract_session_id(log_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(
             interrupted_execution_prompt(
                 task,
@@ -756,7 +777,9 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         parent_task = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
         prompt_path.write_text(
             continuation_prompt(task, context, parent_task),
@@ -802,7 +825,9 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(
             force_push_prompt(task, context, parent_task),
             encoding="utf-8",
@@ -845,7 +870,9 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(execution_prompt(task, context), encoding="utf-8")
 
         return self._run_provider(
@@ -885,7 +912,9 @@ class CodexRunner:
         task.prompt_path = str(prompt_path)
         self.store.save_task(task)
 
-        context = read_task_context(self.config.index_dir, task, project)
+        context = read_task_context(
+            self.config.index_dir, task, project, vault_dir=self.config.obsidian_vault_dir
+        )
         prompt_path.write_text(agent_chat_prompt(task, context), encoding="utf-8")
 
         return self._run_provider(
