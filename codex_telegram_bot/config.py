@@ -243,6 +243,10 @@ class Config:
     orchestrator_require_confirm_for_max: bool = True
     router_learning: bool = True
     router_auto_escalate: bool = True
+    # Off by default so tests and direct Config() users never call a model.
+    router_llm: bool = False
+    router_llm_model: str = "haiku"
+    router_llm_timeout_seconds: int = 45
     task_provider: str = DEFAULT_TASK_PROVIDER
     claude_enabled: bool = True
     claude_command: str | None = None
@@ -410,6 +414,12 @@ class Config:
             ),
             router_learning=parse_bool(env.get("CODEX_ROUTER_LEARNING"), True),
             router_auto_escalate=parse_bool(env.get("CODEX_ROUTER_AUTO_ESCALATE"), True),
+            router_llm=parse_bool(env.get("CODEX_ROUTER_LLM"), True),
+            router_llm_model=env.get("CODEX_ROUTER_LLM_MODEL", "haiku").strip() or "haiku",
+            router_llm_timeout_seconds=max(
+                1,
+                int(env.get("CODEX_ROUTER_LLM_TIMEOUT_SECONDS", "45")),
+            ),
             task_provider=normalize_task_provider(
                 env.get("CODEX_TELEGRAM_TASK_PROVIDER")
                 or env.get("CODEX_TASK_PROVIDER"),

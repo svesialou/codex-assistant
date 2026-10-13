@@ -1,20 +1,27 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
 from ..config import Config, normalize_task_provider
 from ..task_store import TaskRecord
+from .llm_provider import LlmProviderUnavailable
+from .llm_router import LlmTierAdvisor, TierAdvice
 from .router_policy import (
     DEFAULT_CLAUDE_TIER_MODELS,
+    RISK_FLOOR,
     TIER_EFFORT,
+    PolicyChoice,
     RouterPolicy,
     next_tier,
 )
 
 
+LOG = logging.getLogger("codex_telegram_bot")
 COMPLEXITIES = ("trivial", "small", "medium", "large", "critical")
+COMPLEXITY_RANK = {complexity: index for index, complexity in enumerate(COMPLEXITIES)}
 TIERS = ("cheap", "standard", "strong", "max")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
 
@@ -98,9 +105,18 @@ class RoutingDecision:
 
 
 class ModelRouter:
-    def __init__(self, config: Config, policy: RouterPolicy | None = None) -> None:
+    def __init__(
+        self,
+        config: Config,
+        policy: RouterPolicy | None = None,
+        advisor: LlmTierAdvisor | None = None,
+    ) -> None:
         self.config = config
         self.policy = policy
+        self.advisor = advisor
+        # route() runs several times per task (orchestrator, fallback, /routing);
+        # the advisor is asked once per task id.
+        self._advice_cache: dict[str, TierAdvice | None] = {}
 
     def classify(self, task: TaskRecord) -> TaskClassification:
         text = " ".join(
@@ -219,6 +235,9 @@ class ModelRouter:
         policy_source = "manual" if tier != "auto" else "rule"
         policy_reason = ""
         rule_tier = ""
+        advice = self.advice_for(task, classification) if tier == "auto" else None
+        if advice is not None:
+            classification = apply_advice(classification, advice)
 
         selected_codex_tier = classification.recommended_codex_tier
         if tier != "auto":
@@ -239,7 +258,11 @@ class ModelRouter:
             routed = replace_complexity(routed, "small", "standard")
             escalations.append("attachments make trivial task small")
 
-        if tier == "auto" and self.policy is not None and self.config.router_learning:
+        if tier == "auto" and advice is not None and advice.explicit_user_request:
+            # The user named the model: learned/explore must not move it.
+            policy_source = "llm-explicit"
+            policy_reason = advice.reason
+        elif tier == "auto" and self.policy is not None and self.config.router_learning:
             rule_tier = routed.recommended_codex_tier
             choice = self.policy.choose(
                 routed.complexity,
@@ -247,9 +270,25 @@ class ModelRouter:
                 routed.recommended_codex_tier,
                 self.auto_tier_ceiling(),
             )
+            if (
+                advice is not None
+                and COMPLEXITY_RANK[routed.complexity] >= COMPLEXITY_RANK["medium"]
+                and TIER_RANK[choice.tier] < TIER_RANK[rule_tier]
+            ):
+                # For medium+ tasks the LLM tier is a floor for stats and explore.
+                choice = PolicyChoice(
+                    tier=rule_tier,
+                    effort=TIER_EFFORT[rule_tier],
+                    source="rule",
+                    reason=f"kept at LLM tier {rule_tier}",
+                )
             routed = replace_codex_tier(routed, choice.tier)
             policy_source = choice.source
             policy_reason = choice.reason
+
+        if advice is not None and policy_source == "rule":
+            policy_source = "llm"
+            policy_reason = advice.reason
 
         if routed.recommended_codex_tier == "max":
             if not self.config.orchestrator_budget.allow_max_tier:
@@ -298,6 +337,38 @@ class ModelRouter:
             policy_reason=policy_reason,
             rule_tier=rule_tier,
         )
+
+    def advice_for(self, task: TaskRecord, classification: TaskClassification) -> TierAdvice | None:
+        if self.advisor is None:
+            return None
+        if task.id not in self._advice_cache:
+            self._advice_cache[task.id] = self._request_advice(task, classification)
+        return self._advice_cache[task.id]
+
+    def _request_advice(
+        self,
+        task: TaskRecord,
+        classification: TaskClassification,
+    ) -> TierAdvice | None:
+        stats = (
+            self.policy.stats_summary(classification.complexity, task.project_slug)
+            if self.policy is not None
+            else "no stats"
+        )
+        try:
+            advice = self.advisor.advise(
+                task,
+                classification.complexity,
+                classification.recommended_codex_tier,
+                stats,
+            )
+        except (LlmProviderUnavailable, ValueError) as exc:
+            LOG.warning("LLM tier advice failed for task %s, using rules: %s", task.id, exc)
+            return None
+        if advice.tier not in TIERS:
+            LOG.warning("LLM tier advice has invalid tier for task %s: %s", task.id, advice.tier)
+            return None
+        return advice
 
     def executor_model(self, provider: str, tier: str) -> str | None:
         if provider == "claude":
@@ -375,6 +446,18 @@ def replace_codex_tier(
     data = classification.to_dict()
     data["recommended_codex_tier"] = tier
     return TaskClassification(**data)
+
+
+def apply_advice(
+    classification: TaskClassification,
+    advice: TierAdvice,
+) -> TaskClassification:
+    tier = advice.tier
+    floor = RISK_FLOOR.get(classification.complexity)
+    # Only an explicit user request may go below the risk floor.
+    if not advice.explicit_user_request and floor and TIER_RANK[floor] > TIER_RANK[tier]:
+        tier = floor
+    return replace_codex_tier(classification, tier)
 
 
 def replace_complexity(

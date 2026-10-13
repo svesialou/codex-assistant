@@ -160,6 +160,13 @@ class RouterPolicy:
             reason=reason,
         )
 
+    def stats_summary(self, complexity: str, project_slug: str) -> str:
+        with self._lock:
+            return "; ".join(
+                f"{tier} {format_rate(self._stats_for(complexity, project_slug, tier))}"
+                for tier in LADDER
+            )
+
     def record(
         self,
         complexity: str,
