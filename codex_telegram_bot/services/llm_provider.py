@@ -19,6 +19,7 @@ class LlmRequest:
     prompt: str
     model: str | None = None
     max_tokens: int | None = None
+    timeout_seconds: int | None = None
     metadata: dict[str, str] | None = None
 
 
@@ -70,7 +71,7 @@ class ClaudeProvider:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                timeout=self.config.claude_timeout_seconds,
+                timeout=request.timeout_seconds or self.config.claude_timeout_seconds,
                 env=env,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:

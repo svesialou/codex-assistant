@@ -52,6 +52,7 @@ from .services.git_safety import (
 from .services.executors import executor_agent_name, executor_display_name
 from .services.intent_router import IntentContext, IntentResult, IntentRouter
 from .services.llm_provider import ClaudeProvider
+from .services.llm_router import LlmTierAdvisor
 from .services.model_router import ModelRouter, normalize_manual_tier, render_routing_decision
 from .services.orchestrator import (
     KIND_AGENT_CHAT,
@@ -662,7 +663,24 @@ class CodexTelegramBot:
         self.project_resolver = ProjectResolver(self.aliases)
         self.task_resolver = TaskResolver(self.store)
         self.router_policy = RouterPolicy(config.state_dir / "router-stats.json")
-        self.model_router = ModelRouter(config, self.router_policy)
+        self.model_router = ModelRouter(
+            config,
+            self.router_policy,
+            advisor=(
+                LlmTierAdvisor(
+                    ClaudeProvider(
+                        replace(
+                            config,
+                            claude_command=config.claude_command or DEFAULT_CLAUDE_VERIFY_COMMAND,
+                        )
+                    ),
+                    model=config.router_llm_model,
+                    timeout_seconds=config.router_llm_timeout_seconds,
+                )
+                if config.router_llm
+                else None
+            ),
+        )
         self.orchestrator = OrchestratorService(
             config=config,
             store=self.store,

@@ -250,6 +250,9 @@ CODEX_STRONG_MODEL=
 CODEX_MAX_MODEL=
 CODEX_ROUTER_LEARNING=1        # learning router for every executor run
 CODEX_ROUTER_AUTO_ESCALATE=1   # retry one tier higher when verify fails
+CODEX_ROUTER_LLM=1             # small LLM (haiku) picks the tier before RouterPolicy
+CODEX_ROUTER_LLM_MODEL=haiku
+CODEX_ROUTER_LLM_TIMEOUT_SECONDS=45
 ```
 
 ### Learning model router
@@ -258,6 +261,12 @@ With `CODEX_ROUTER_LEARNING=1` (default) every task, follow-up, and agent chat
 goes through the router, also when orchestrator mode is off:
 
 1. The regex `ModelRouter` classifies complexity and proposes a tier.
+   With `CODEX_ROUTER_LLM=1` (default) a short `haiku` call also reads the task,
+   project, attachment names, and per-tier stats, and proposes a tier. If the user
+   explicitly names a model or strength ("use opus"), that tier is taken as manual
+   and learned/explore do not change it. On timeout or invalid JSON the regex
+   route is used. Risk floors still apply unless the user asked explicitly.
+   Source shows as `llm` or `llm-explicit` in the `router:` line.
 2. `RouterPolicy` picks the executor tier and effort
    (`cheap`/low, `standard`/medium, `strong`/high). It switches to a
    cheaper tier only after it is proven (≥5 runs, ≥80% smoothed success),
