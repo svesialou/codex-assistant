@@ -253,6 +253,9 @@ CODEX_ROUTER_AUTO_ESCALATE=1   # retry one tier higher when verify fails
 CODEX_ROUTER_LLM=1             # small LLM (haiku) picks the tier before RouterPolicy
 CODEX_ROUTER_LLM_MODEL=haiku
 CODEX_ROUTER_LLM_TIMEOUT_SECONDS=45
+CODEX_ROUTER_CRITIC_MIN_COMPLEXITY=medium  # critic verify from this complexity up, or off
+CODEX_ROUTER_VERIFY_SAMPLE_RATE=0.2        # share of other auto-routed runs that get full verify
+CODEX_ROUTER_FEEDBACK=1                    # learn from "continue + fix it" follow-ups
 ```
 
 ### Learning model router
@@ -262,24 +265,44 @@ goes through the router, also when orchestrator mode is off:
 
 1. The regex `ModelRouter` classifies complexity and proposes a tier.
    With `CODEX_ROUTER_LLM=1` (default) a short `haiku` call also reads the task,
-   project, attachment names, and per-tier stats, and proposes a tier. If the user
+   project, attachment names, per-tier stats, and outcomes of similar past tasks
+   (TF-IDF kNN over routed task prompts), and proposes a tier. If the user
    explicitly names a model or strength ("use opus"), that tier is taken as manual
    and learned/explore do not change it. On timeout or invalid JSON the regex
    route is used. Risk floors still apply unless the user asked explicitly.
    Source shows as `llm` or `llm-explicit` in the `router:` line.
 2. `RouterPolicy` picks the executor tier and effort
-   (`cheap`/low, `standard`/medium, `strong`/high). It switches to a
-   cheaper tier only after it is proven (≥5 runs, ≥80% smoothed success),
-   skips tiers that keep failing, and explores one tier cheaper ~10% of the time.
+   (`cheap`/low, `standard`/medium, `strong`/high). A tier is proven good or
+   bad only when its Wilson bound (≥5 runs, z=1.28) is above or below 75%
+   success, so one failure in a few runs does not push work to opus. Among
+   proven cheaper tiers it takes the best `lower bound − 0.25 × relative cost`.
+   It explores one tier cheaper ~10% of the time, 30% when the critic often
+   calls the chosen tier overkill. A cheaper tier that solved ≥3 of 3 similar
+   past tasks may also be tried (`similar`). For `medium` tasks stats may go one
+   step below the LLM tier, for `large`+ the LLM tier is kept.
    `large` never drops below `standard`, `critical` never below `strong`.
-3. Verify by risk: `light` checks the exit code and a non-empty answer;
-   `full` adds a read-only Claude review of the diff for high-risk work and
-   for any run on a tier cheaper than the rule proposed.
+3. Verify: `light` checks the exit code and a non-empty answer; `full` adds a
+   read-only Claude review of the diff (sonnet, opus for `critical`). Full
+   verify runs for high-risk work, for runs cheaper than the rule tier, for
+   `CODEX_ROUTER_CRITIC_MIN_COMPLEXITY`+ work with the critic prompt
+   (assumptions, simpler alternative, effort fit), and for a stable sample of
+   other auto runs, so `strong` runs get the same reviewed signal as cheap ones.
 4. On fail the run is retried once on the next tier, up to
    `CODEX_ORCHESTRATOR_MAX_AUTO_TIER` (`max` only when confirmation is off).
 5. Every outcome, with tokens and cost parsed from the run log, is stored in
-   `~/.codex/telegram-bot/router-stats.json`. On first start, task history is
-   seeded as the `strong` baseline. `/router` shows the stats and savings.
+   `~/.codex/telegram-bot/router-stats.json`, and on the task (`outcome`).
+   On first start, task history is seeded as the `strong` baseline, capped at
+   20 runs per bucket; v1 stats files are capped the same way on load and kept
+   as `router-stats.json.v1.bak`. `/router` shows the stats, user fixes, and
+   the tier split of the last 30 days.
+6. Feedback: when a completed task is continued, `haiku` labels the message
+   `correction`, `extension`, `new`, or `approval`. A confident correction
+   turns the parent run into a failure (once per run) and keeps the fix at
+   least on the parent tier. The `🧐 Критик` button runs the critic on a
+   finished task; `request_changes` counts as a correction and offers
+   `🛠 Исправить по критике`, which starts a continuation with its fix prompt.
+7. Planning runs on sonnet, opus only for `large`/`critical` work or when the
+   user names the model.
 
 Without `CLAUDE_*_MODEL` the Claude executor uses the CLI aliases `haiku`,
 `sonnet`, and `opus` per tier. Full verify uses `CODEX_CLAUDE_CMD` when set,

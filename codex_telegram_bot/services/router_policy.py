@@ -4,18 +4,26 @@ Every executor run is recorded per (complexity, project) bucket and in a
 complexity-wide fallback bucket. The regex classification from ModelRouter
 stays the starting rule; stats only move the choice once they are proven:
 
-- a cheaper tier with enough successful runs replaces the rule tier;
+- a tier is proven good/bad only when a Wilson confidence bound clears the
+  target success rate, so one failure in a handful of runs proves nothing;
+- among proven cheaper tiers the one with the best `quality - cost` utility
+  replaces the rule tier (the LLMRouter quality/cost trade-off);
 - a rule tier that keeps failing is skipped in favour of the next one;
-- occasionally a one-step cheaper tier is explored to keep learning.
+- occasionally a one-step cheaper tier is explored to keep learning, more
+  often when the critic keeps calling the chosen tier overkill;
+- a user correction after a "successful" run turns that run into a failure.
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import threading
+from collections import Counter
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -32,10 +40,23 @@ DEFAULT_CLAUDE_TIER_MODELS = {
 # Risky work never drops below this tier, whatever the stats say.
 RISK_FLOOR = {"critical": "strong", "large": "standard"}
 MIN_SAMPLES = 5
-SUCCESS_THRESHOLD = 0.8
+# Target success rate; Wilson bounds at Z decide "proven good/bad" against it.
+SUCCESS_THRESHOLD = 0.75
+CONFIDENCE_Z = 1.28
+# Relative cost per tier (measured: small haiku $0.24, sonnet $0.45, opus $1.58)
+# and how many success-rate points one strong-cost unit is worth.
+TIER_COST = {"cheap": 0.15, "standard": 0.35, "strong": 1.0, "max": 1.3}
+COST_WEIGHT = 0.25
 EXPLORE_RATE = 0.1
+# Exploration rate when the critic often finds the chosen tier overkill.
+OVERKILL_EXPLORE_RATE = 0.3
+OVERKILL_RATIO = 0.3
 GLOBAL_PROJECT = "*"
-STATS_VERSION = 1
+# Pre-routing history only describes exit codes of the CLI default model;
+# it is capped so live, reviewed runs can outweigh it.
+LEGACY_CAP = 20
+LEGACY_TIER = "strong"
+STATS_VERSION = 2
 # Last cumulative cost kept per Claude session, to price resumed runs.
 MAX_TRACKED_SESSIONS = 500
 
@@ -48,16 +69,27 @@ class ArmStats:
     cost_usd: float = 0.0
     tokens: int = 0
     duration_seconds: float = 0.0
+    # Runs the user had to correct afterwards (already counted as failures).
+    corrections: int = 0
+    # Runs the critic judged as more model than the task needed.
+    overkill: int = 0
 
-    def success_rate(self) -> float:
-        # Laplace smoothing: 5/5 -> 0.86, 4/5 -> 0.71.
-        return (self.successes + 1) / (self.runs + 2)
+    def lower_bound(self) -> float:
+        return wilson_bounds(self.successes, self.runs)[0]
+
+    def upper_bound(self) -> float:
+        return wilson_bounds(self.successes, self.runs)[1]
 
     def proven_good(self) -> bool:
-        return self.runs >= MIN_SAMPLES and self.success_rate() >= SUCCESS_THRESHOLD
+        # 5/5 -> 0.75, 43/47 -> 0.85, 4/5 -> 0.51.
+        return self.runs >= MIN_SAMPLES and self.lower_bound() >= SUCCESS_THRESHOLD
 
     def proven_bad(self) -> bool:
-        return self.runs >= MIN_SAMPLES and self.success_rate() < SUCCESS_THRESHOLD
+        # 6/7 -> 0.96 and 12/15 -> 0.90 are not bad; 3/6 -> 0.73 is.
+        return self.runs >= MIN_SAMPLES and self.upper_bound() < SUCCESS_THRESHOLD
+
+    def overkill_ratio(self) -> float:
+        return self.overkill / self.runs if self.runs else 0.0
 
     def avg_cost(self) -> float | None:
         return self.cost_usd / self.priced_runs if self.priced_runs else None
@@ -143,12 +175,20 @@ class RouterPolicy:
             if LADDER_RANK[tier] < LADDER_RANK[chosen] and stats[tier].proven_good()
         ]
         if cheaper_proven:
-            chosen = cheaper_proven[0]
-            source = "learned"
-            reason = f"{chosen} is proven ({format_rate(stats[chosen])})"
+            best = max([chosen, *cheaper_proven], key=lambda tier: utility(tier, stats[tier]))
+            if best != chosen:
+                chosen = best
+                source = "learned"
+                reason = f"{chosen} is proven ({format_rate(stats[chosen])})"
 
         index = candidates.index(chosen)
-        if index > 0 and self.rng.random() < self.explore_rate:
+        explore_rate = self.explore_rate
+        if (
+            stats[chosen].runs >= MIN_SAMPLES
+            and stats[chosen].overkill_ratio() >= OVERKILL_RATIO
+        ):
+            explore_rate = max(explore_rate, OVERKILL_EXPLORE_RATE)
+        if index > 0 and self.rng.random() < explore_rate:
             cheaper = candidates[index - 1]
             if not stats[cheaper].proven_bad():
                 chosen, source = cheaper, "explore"
@@ -192,6 +232,40 @@ class RouterPolicy:
                     arm.cost_usd += usage.cost_usd
             if save:
                 self._save_locked()
+
+    def record_feedback(
+        self,
+        complexity: str,
+        project_slug: str,
+        tier: str,
+        counted_success: bool,
+        correction: bool = True,
+        overkill: bool = False,
+    ) -> None:
+        """Adjust an already recorded run after user or critic feedback.
+
+        A correction turns a run counted as a success into a failure; the
+        caller makes sure feedback is applied once per run.
+        """
+        if tier not in LADDER_RANK:
+            return
+        with self._lock:
+            for key in {bucket_key(complexity, project_slug), bucket_key(complexity, GLOBAL_PROJECT)}:
+                arm = self._buckets.setdefault(key, _Bucket()).arm(tier)
+                if correction:
+                    arm.corrections += 1
+                    if counted_success and arm.successes > 0:
+                        arm.successes -= 1
+                if overkill:
+                    arm.overkill += 1
+            self._save_locked()
+
+    def cap_runs(self, tier: str, cap: int = LEGACY_CAP) -> None:
+        """Scale one tier down to at most `cap` runs per bucket, keeping its rates."""
+        with self._lock:
+            for bucket in self._buckets.values():
+                if tier in bucket.arms:
+                    cap_arm(bucket.arms[tier], cap)
 
     def save(self) -> None:
         with self._lock:
@@ -250,8 +324,9 @@ class RouterPolicy:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return {}
-        if not isinstance(payload, dict) or payload.get("version") != STATS_VERSION:
+        if not isinstance(payload, dict) or payload.get("version") not in {1, STATS_VERSION}:
             return {}
+        legacy = payload.get("version") == 1
         sessions = payload.get("sessions") or {}
         if isinstance(sessions, dict):
             self._session_costs = {
@@ -268,7 +343,17 @@ class RouterPolicy:
                 if tier in LADDER_RANK and isinstance(raw, dict):
                     known = {name: raw[name] for name in ArmStats.__dataclass_fields__ if name in raw}
                     bucket.arms[tier] = ArmStats(**known)
+                    if legacy and tier == LEGACY_TIER:
+                        cap_arm(bucket.arms[tier], LEGACY_CAP)
             buckets[str(key)] = bucket
+        if legacy:
+            # v1 stats are dominated by seeded exit-code runs; keep a backup.
+            backup = self.path.with_name(self.path.name + ".v1.bak")
+            if not backup.exists():
+                try:
+                    backup.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
+                except OSError:
+                    pass
         return buckets
 
     def _save_locked(self) -> None:
@@ -292,6 +377,37 @@ def bucket_key(complexity: str, project_slug: str) -> str:
 
 def format_rate(arm: ArmStats) -> str:
     return f"{arm.successes}/{arm.runs} ok"
+
+
+def wilson_bounds(successes: int, runs: int, z: float = CONFIDENCE_Z) -> tuple[float, float]:
+    if runs <= 0:
+        return 0.0, 1.0
+    rate = successes / runs
+    denominator = 1 + z * z / runs
+    center = rate + z * z / (2 * runs)
+    margin = z * math.sqrt(rate * (1 - rate) / runs + z * z / (4 * runs * runs))
+    return (
+        max(0.0, (center - margin) / denominator),
+        min(1.0, (center + margin) / denominator),
+    )
+
+
+def utility(tier: str, arm: ArmStats) -> float:
+    return arm.lower_bound() - COST_WEIGHT * TIER_COST[tier]
+
+
+def cap_arm(arm: ArmStats, cap: int) -> None:
+    if arm.runs <= cap:
+        return
+    scale = cap / arm.runs
+    arm.successes = round(arm.successes * scale)
+    arm.corrections = round(arm.corrections * scale)
+    arm.overkill = round(arm.overkill * scale)
+    arm.cost_usd *= scale
+    arm.priced_runs = round(arm.priced_runs * scale)
+    arm.tokens = int(arm.tokens * scale)
+    arm.duration_seconds *= scale
+    arm.runs = cap
 
 
 def next_tier(tier: str, max_tier: str) -> str | None:
@@ -402,6 +518,7 @@ def seed_from_history(
             save=False,
         )
         seeded += 1
+    policy.cap_runs(baseline_tier, LEGACY_CAP)
     policy.save()
     return seeded
 
@@ -410,7 +527,7 @@ def render_router_stats(policy: RouterPolicy, baseline_tier: str = "strong") -> 
     stats = policy.global_stats()
     if not stats:
         return "Router: статистики пока нет."
-    lines = ["Router stats (tier: runs, success, avg cost, avg tokens):"]
+    lines = ["Router stats (tier: runs, success, avg cost, avg tokens, user fixes):"]
     savings = 0.0
     for complexity in ("trivial", "small", "medium", "large", "critical"):
         arms = stats.get(complexity)
@@ -428,12 +545,44 @@ def render_router_stats(policy: RouterPolicy, baseline_tier: str = "strong") -> 
             mark = " ✓" if arm.proven_good() else (" ✗" if arm.proven_bad() else "")
             lines.append(
                 f"- {tier} ({TIER_EFFORT[tier]}): {arm.runs}, "
-                f"{arm.successes * 100 // arm.runs}%, {cost_text}, {arm.avg_tokens()}{mark}"
+                f"{arm.successes * 100 // arm.runs}%, {cost_text}, {arm.avg_tokens()}, "
+                f"fix {arm.corrections}{mark}"
             )
             if tier != baseline_tier and baseline_cost is not None and avg_cost is not None:
                 savings += arm.priced_runs * (baseline_cost - avg_cost)
     lines.append(f"\nЭкономия vs {baseline_tier}: ~${savings:.2f}")
     lines.append(
-        f"✓ proven (≥{MIN_SAMPLES} runs, ≥{int(SUCCESS_THRESHOLD * 100)}%), ✗ failing."
+        f"✓ proven ≥{int(SUCCESS_THRESHOLD * 100)}%, ✗ proven below it "
+        f"(≥{MIN_SAMPLES} runs, Wilson z={CONFIDENCE_Z}). History before routing is capped "
+        f"at {LEGACY_CAP} runs per arm."
     )
+    return "\n".join(lines)
+
+
+def render_recent_routing(task_payloads: Iterable[dict[str, Any]], days: int = 30) -> str:
+    """Where routed runs actually went lately, and how often the user fixed them."""
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    tiers: Counter[str] = Counter()
+    sources: Counter[str] = Counter()
+    corrected: Counter[str] = Counter()
+    for payload in task_payloads:
+        routing = payload.get("model_routing") or {}
+        tier = routing.get("selected_tier")
+        if not tier or str(payload.get("created_at") or "") < since:
+            continue
+        tiers[tier] += 1
+        sources[str(routing.get("policy_source") or "-")] += 1
+        if (routing.get("feedback") or {}).get("applied"):
+            corrected[tier] += 1
+    total = sum(tiers.values())
+    if not total:
+        return f"Последние {days} дней: маршрутизированных задач нет."
+    lines = [f"Последние {days} дней ({total} задач):"]
+    for tier in LADDER:
+        if tiers[tier]:
+            lines.append(
+                f"- {tier}: {tiers[tier]} ({tiers[tier] * 100 // total}%), "
+                f"исправлений {corrected[tier]}"
+            )
+    lines.append("Источник: " + ", ".join(f"{name} {count}" for name, count in sources.most_common()))
     return "\n".join(lines)

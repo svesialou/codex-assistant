@@ -8,7 +8,8 @@ from pathlib import Path
 from codex_telegram_bot.bot import CodexTelegramBot
 from codex_telegram_bot.config import Config
 from codex_telegram_bot.project_index import ProjectInfo
-from codex_telegram_bot.services.llm_provider import LlmRequest, LlmResponse
+from codex_telegram_bot.services.llm_provider import LlmRequest, LlmResponse, MockProvider
+from codex_telegram_bot.services.llm_router import FollowupClassifier
 from codex_telegram_bot.task_store import TaskRecord, TaskStore
 
 
@@ -114,23 +115,37 @@ class FakeRunner:
     def run_agent_chat(self, task, project, model=None, provider="codex", effort=None):
         return self._run("run_agent_chat", task, model, provider, effort, "agent_completed")
 
+    def run_followup_execution(self, task, project, model=None, provider="codex", effort=None):
+        return self._run("run_followup_execution", task, model, provider, effort)
+
 
 class FakeReviewer:
-    def __init__(self, verdict: str) -> None:
+    def __init__(self, verdict: str, effort_fit: str = "ok") -> None:
         self.verdict = verdict
+        self.effort_fit = effort_fit
         self.models: list[str | None] = []
+        self.roles: list[str] = []
+        self.prompts: list[str] = []
 
     def complete(self, request: LlmRequest) -> LlmResponse:
         self.models.append(request.model)
+        self.roles.append(request.role)
+        self.prompts.append(request.prompt)
         return LlmResponse(
             text=json.dumps(
                 {
                     "verdict": self.verdict,
                     "review_summary": "missing tests",
+                    "effort_fit": self.effort_fit,
                     "follow_up_prompt_for_codex": "Add the missing tests.",
                 }
             )
         )
+
+
+def classifier_replying(label: str, confidence: float = 0.9) -> FollowupClassifier:
+    reply = json.dumps({"label": label, "confidence": confidence, "reason": "user says it is broken"})
+    return FollowupClassifier(MockProvider([LlmResponse(text=reply)]), model="haiku", timeout_seconds=5)
 
 
 def routed_bot(tmp: str, fake_returncodes: list[int] | None = None):
@@ -355,6 +370,93 @@ class OrchestratorFlowTest(unittest.TestCase):
         self.assertEqual(loaded.model_routing["verify"], "light")
         self.assertEqual(reviewer.models, [])
         self.assertFalse(any(item.startswith("router:") for item in sent))
+
+
+    def test_correction_followup_turns_parent_run_into_failure_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, fake, _ = routed_bot(tmp)
+            bot.spawn = lambda target, *args: target(*args)
+            parent = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "Исправь typo в README")
+            bot.execute_task(parent.id)
+            bot.router_feedback.classifier = classifier_replying("correction")
+
+            bot.create_followup_task_for_parent(
+                10, 20, parent.id, "Опечатка осталась, исправь нормально", "telegram", ""
+            )
+            followup = next(item for item in bot.store.tasks() if item.parent_task_id == parent.id)
+            again = bot.router_feedback.on_followup(followup, bot.store.load_task(parent.id), "")
+            stats = router_stats(bot)["trivial|demo"]["cheap"]
+            loaded_parent = bot.store.load_task(parent.id)
+            loaded_followup = bot.store.load_task(followup.id)
+
+        self.assertEqual(fake.calls[1][0], "run_followup_execution")
+        self.assertEqual(loaded_parent.model_routing["feedback"]["label"], "correction")
+        self.assertTrue(loaded_parent.model_routing["feedback"]["applied"])
+        self.assertEqual(loaded_followup.model_routing["floor_tier"], "cheap")
+        # Parent run 1/1 became 0/1; the follow-up is a small task in its own bucket.
+        self.assertEqual((stats["runs"], stats["successes"], stats["corrections"]), (1, 0, 1))
+        self.assertIsNone(again)
+
+    def test_extension_followup_does_not_count_against_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, _, _ = routed_bot(tmp)
+            bot.spawn = lambda target, *args: target(*args)
+            parent = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "Исправь typo в README")
+            bot.execute_task(parent.id)
+            bot.router_feedback.classifier = classifier_replying("extension")
+
+            bot.create_followup_task_for_parent(10, 20, parent.id, "Теперь закоммить", "telegram", "")
+            stats = router_stats(bot)["trivial|demo"]["cheap"]
+            loaded_parent = bot.store.load_task(parent.id)
+
+        self.assertEqual(loaded_parent.model_routing["feedback"]["label"], "extension")
+        self.assertFalse(loaded_parent.model_routing["feedback"]["applied"])
+        self.assertEqual((stats["runs"], stats["successes"], stats["corrections"]), (1, 1, 0))
+
+    def test_medium_run_gets_critic_review_on_any_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, fake, sent = routed_bot(tmp)
+            bot.config = Config(**{**bot.config.__dict__, "router_critic_min_complexity": "medium"})
+            bot.model_router.config = bot.config
+            reviewer = FakeReviewer("approve", effort_fit="over")
+            bot.orchestrator.verify_provider = reviewer
+            prompt = "Добавь feature для экспорта отчётов. " + "Подробности задачи. " * 15
+            task = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", prompt)
+
+            bot.execute_task(task.id)
+            loaded = bot.store.load_task(task.id)
+            stats = router_stats(bot)["medium|demo"]
+
+        self.assertEqual(fake.calls, [("run_execution", "sonnet", "claude")])
+        self.assertEqual(loaded.model_routing["verify"], "full")
+        self.assertEqual(loaded.model_routing["outcome"], "success")
+        self.assertEqual(reviewer.models, ["sonnet"])
+        self.assertIn("You are the Critic", reviewer.prompts[0])
+        self.assertEqual(stats["standard"]["overkill"], 1)
+
+    def test_critic_button_reviews_task_learns_and_offers_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bot, fake, sent = routed_bot(tmp)
+            bot.spawn = lambda target, *args: target(*args)
+            parent = bot.store.create_task(10, 20, "demo", "demo", "/tmp/demo", "Исправь typo в README")
+            bot.execute_task(parent.id)
+            reviewer = FakeReviewer("request_changes")
+            bot.orchestrator.verify_provider = reviewer
+
+            bot.handle_task_callback(10, 20, "review", parent.id)
+            critic_exists = (bot.store.task_dir(parent.id) / "critic.json").exists()
+            bot.handle_task_callback(10, 20, "critic_fix", parent.id)
+            followup = next(item for item in bot.store.tasks() if item.parent_task_id == parent.id)
+            stats = router_stats(bot)["trivial|demo"]["cheap"]
+
+        self.assertEqual(reviewer.roles, ["critic"])
+        self.assertTrue(critic_exists)
+        self.assertTrue(any(item.startswith(f"🧐 Critic for {parent.id}") for item in sent))
+        self.assertTrue(any("Router: учёл как исправление для cheap" in item for item in sent))
+        self.assertEqual(followup.source, "critic")
+        self.assertIn("Add the missing tests.", followup.prompt)
+        self.assertEqual(fake.calls[-1][0], "run_followup_execution")
+        self.assertEqual((stats["runs"], stats["successes"], stats["corrections"]), (1, 0, 1))
 
 
 if __name__ == "__main__":

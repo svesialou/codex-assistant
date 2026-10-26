@@ -51,8 +51,8 @@ from .services.git_safety import (
 )
 from .services.executors import executor_agent_name, executor_display_name
 from .services.intent_router import IntentContext, IntentResult, IntentRouter
-from .services.llm_provider import ClaudeProvider
-from .services.llm_router import LlmTierAdvisor
+from .services.llm_provider import ClaudeProvider, LlmProviderUnavailable
+from .services.llm_router import FollowupClassifier, LlmTierAdvisor
 from .services.model_router import ModelRouter, normalize_manual_tier, render_routing_decision
 from .services.orchestrator import (
     KIND_AGENT_CHAT,
@@ -60,6 +60,7 @@ from .services.orchestrator import (
     KIND_FOLLOWUP,
     KIND_RECOVER,
     OrchestratorService,
+    render_critic_result,
 )
 from .services.project_aliases import (
     ProjectAliasStore,
@@ -85,9 +86,16 @@ from .services.project_resolver import ProjectResolver
 from .services.redaction import RedactionService
 from .services.session_index import collect_relations, collect_session_lines, scan_sessions
 from .services.runtime_identity import render_runtime_identity, runtime_identity
-from .services.router_policy import RouterPolicy, render_router_stats, seed_from_history
+from .services.router_feedback import RouterFeedback
+from .services.router_policy import (
+    RouterPolicy,
+    render_recent_routing,
+    render_router_stats,
+    seed_from_history,
+)
 from .services.runtime_sync import compare_runtime_files, render_runtime_drift
 from .services.task_resolver import TaskResolver
+from .services.task_similarity import TaskSimilarity
 from .services.task_events import TaskEventLog, render_task_events
 from .task_store import (
     ChatState,
@@ -236,11 +244,25 @@ def inline_task_keyboard(task_id: str) -> dict[str, Any]:
     }
 
 
+def critic_keyboard(task_id: str) -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "🛠 Исправить по критике", "callback_data": f"task:critic_fix:{task_id}"},
+            ],
+            [
+                {"text": "🔁 Продолжить", "callback_data": f"task:continue:{task_id}"},
+                {"text": "🧠 Routing", "callback_data": f"task:routing:{task_id}"},
+            ],
+        ]
+    }
+
+
 def completed_task_keyboard(task_id: str) -> dict[str, Any]:
     return {
         "inline_keyboard": [
             [
-                {"text": "🔍 Review", "callback_data": f"task:review:{task_id}"},
+                {"text": "🧐 Критик", "callback_data": f"task:review:{task_id}"},
                 {"text": "📊 Изменения", "callback_data": f"task:safety:{task_id}"},
             ],
             [
@@ -544,6 +566,9 @@ def tail_file(path: str, max_lines: int = 60) -> str:
     return "\n".join(readable[-max_lines:]) or "Log is empty."
 
 
+CRITIC_PHASES = {"completed", "needs_human", "agent_completed"}
+
+
 def read_task_final(task: TaskRecord) -> str:
     if not task.final_path:
         return ""
@@ -577,6 +602,17 @@ def render_task_routing(routing: dict[str, Any]) -> str:
         for key in ["classifier", "architect", "executor", "reviewer"]:
             lines.append(f"  {key}: {selected_models.get(key) or 'none'}")
     lines.append(f"- executor provider: {routing.get('executor_provider') or '-'}")
+    if routing.get("policy_source"):
+        reason = routing.get("policy_reason") or ""
+        lines.append(f"- policy: {routing['policy_source']}{': ' + reason if reason else ''}")
+    if routing.get("verify"):
+        lines.append(f"- verify: {routing['verify']}")
+    if routing.get("outcome"):
+        lines.append(f"- outcome: {routing['outcome']}")
+    feedback = routing.get("feedback") or {}
+    if feedback.get("label"):
+        applied = " (учтено как исправление)" if feedback.get("applied") else ""
+        lines.append(f"- feedback: {feedback['label']}{applied}")
     warnings = routing.get("warnings") or []
     for warning in warnings:
         lines.append(f"- warning: {warning}")
@@ -663,21 +699,36 @@ class CodexTelegramBot:
         self.project_resolver = ProjectResolver(self.aliases)
         self.task_resolver = TaskResolver(self.store)
         self.router_policy = RouterPolicy(config.state_dir / "router-stats.json")
+        router_llm_provider = ClaudeProvider(
+            replace(
+                config,
+                claude_command=config.claude_command or DEFAULT_CLAUDE_VERIFY_COMMAND,
+            )
+        )
         self.model_router = ModelRouter(
             config,
             self.router_policy,
             advisor=(
                 LlmTierAdvisor(
-                    ClaudeProvider(
-                        replace(
-                            config,
-                            claude_command=config.claude_command or DEFAULT_CLAUDE_VERIFY_COMMAND,
-                        )
-                    ),
+                    router_llm_provider,
                     model=config.router_llm_model,
                     timeout_seconds=config.router_llm_timeout_seconds,
                 )
                 if config.router_llm
+                else None
+            ),
+            similarity=TaskSimilarity(lambda: (task.to_dict() for task in self.store.tasks())),
+        )
+        self.router_feedback = RouterFeedback(
+            self.store,
+            self.router_policy,
+            classifier=(
+                FollowupClassifier(
+                    router_llm_provider,
+                    model=config.router_llm_model,
+                    timeout_seconds=config.router_llm_timeout_seconds,
+                )
+                if config.router_llm and config.router_feedback
                 else None
             ),
         )
@@ -1457,7 +1508,12 @@ class CodexTelegramBot:
         elif command == "/runtime":
             self.show_runtime_identity(chat_id)
         elif command == "/router":
-            self.send(chat_id, render_router_stats(self.router_policy))
+            self.send(
+                chat_id,
+                render_router_stats(self.router_policy)
+                + "\n\n"
+                + render_recent_routing(task.to_dict() for task in self.store.tasks()),
+            )
         elif command == "/note":
             self.obsidian_note_command(chat_id, args)
         elif command == "/obsidian":
@@ -3650,7 +3706,12 @@ class CodexTelegramBot:
             log_path,
             message_id=status_message_id,
         )
-        task = self.runner.run_planning(task, project, provider=provider)
+        task = self.runner.run_planning(
+            task,
+            project,
+            model=self.model_router.planning_model(task, provider),
+            provider=provider,
+        )
         self.remember_task_context(task, "plan" if task.phase == "planned" else "status")
         self.finish_codex_status(status, task)
         if task.phase == "planned":
@@ -3904,6 +3965,7 @@ class CodexTelegramBot:
             message_id=status_message_id,
         )
         if self.config.router_learning:
+            self.learn_from_followup(task)
             task = self.orchestrator.run_routed(
                 task,
                 project,
@@ -3945,6 +4007,26 @@ class CodexTelegramBot:
             )
             reply_markup = failed_task_keyboard(task.id)
         self.send(task.chat_id, message, reply_markup=reply_markup)
+
+    def learn_from_followup(self, task: TaskRecord) -> None:
+        """A "continue + fix it" message re-scores the parent run for the router."""
+        parent = self.store.load_task(task.parent_task_id) if task.parent_task_id else None
+        if parent is None:
+            return
+        result = self.router_feedback.on_followup(task, parent, read_task_final(parent))
+        if result is None:
+            return
+        tier = parent.model_routing.get("selected_tier") or "-"
+        message = f"Follow-up: {result.label} ({result.reason or '-'})."
+        if result.applied:
+            message += f" Router учёл исправление для {parent.id} ({tier})."
+        self.append_event(
+            task.id,
+            "agent_message",
+            "ModelRouter",
+            message,
+            {"parent_task_id": parent.id, "label": result.label, "applied": result.applied},
+        )
 
     def cancel_task(self, chat_id: int, task_id: str) -> None:
         task = self.store.load_task(task_id)
@@ -4153,6 +4235,8 @@ class CodexTelegramBot:
             self.propose_task_memory(chat_id, user_id, task.id)
         elif action == "force_push":
             self.force_push_task(chat_id, task.id)
+        elif action == "critic_fix":
+            self.fix_by_critic(chat_id, user_id, task.id)
 
     def show_task_brain(self, chat_id: int, task_id: str) -> None:
         task = self.recent_context_task(chat_id, task_id)
@@ -4215,13 +4299,70 @@ class CodexTelegramBot:
         if task is None:
             self.send(chat_id, "Task not found.", reply_markup=tasks_keyboard())
             return
-        self.append_event(task.id, "review", "Reviewer", "Review requested from Telegram UI.")
         self.set_last_view(chat_id, "review")
         self.remember_task_context(task, "review")
-        self.send(
+        if task.phase not in CRITIC_PHASES:
+            self.send(
+                chat_id,
+                f"Critic: задача {task.id} в статусе {task.phase}, критик работает с завершёнными.",
+                reply_markup=self.task_view_keyboard(task),
+            )
+            return
+        self.append_event(task.id, "review", "Critic", "Critic requested from Telegram UI.")
+        self.send(chat_id, f"🧐 Critic: проверяю {task.id}.")
+        self.spawn(self.run_task_critic, chat_id, task.id)
+
+    def run_task_critic(self, chat_id: int, task_id: str) -> None:
+        task = self.store.load_task(task_id)
+        if task is None:
+            return
+        project = self.find_project(task.project_slug) or self.project_from_task_record(task)
+        try:
+            review = self.orchestrator.run_critic(task, project)
+        except LlmProviderUnavailable as exc:
+            self.send(chat_id, f"Critic недоступен: {exc}", reply_markup=self.task_view_keyboard(task))
+            return
+        self.append_event(
+            task.id,
+            "review",
+            "Critic",
+            f"Critic verdict: {review.verdict}, effort {review.effort_fit or '-'}",
+            {"verdict": review.verdict, "effort_fit": review.effort_fit},
+        )
+        text = render_critic_result(task.id, review)
+        if self.config.router_learning:
+            feedback = self.router_feedback.on_critic(
+                task, review.verdict, review.effort_fit, review.review_summary
+            )
+            if feedback is not None and feedback.applied:
+                tier = task.model_routing.get("selected_tier") or "-"
+                text += f"\n\nRouter: учёл как исправление для {tier}."
+        reply_markup = (
+            critic_keyboard(task.id)
+            if review.verdict == "request_changes"
+            and review.follow_up_prompt_for_codex.strip()
+            and task.phase == "completed"
+            else self.task_view_keyboard(task)
+        )
+        self.send(chat_id, text[:3900], reply_markup=reply_markup)
+
+    def fix_by_critic(self, chat_id: int, user_id: int | None, task_id: str) -> None:
+        path = self.store.task_dir(task_id) / "critic.json"
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            payload = {}
+        prompt = str(payload.get("follow_up_prompt_for_codex") or "").strip()
+        if not prompt:
+            self.send(chat_id, "Critic: нет готового промпта для исправления. Запусти критика ещё раз.")
+            return
+        self.create_followup_task_for_parent(
             chat_id,
-            f"🔍 Review for {task.id}\nReview role is prepared as metadata. Automated reviewer execution is not enabled in this increment.",
-            reply_markup=self.task_view_keyboard(task),
+            user_id,
+            task_id,
+            f"Исправь замечания критика:\n{prompt}",
+            source="critic",
+            source_path=str(path),
         )
 
     def show_task_trace(self, chat_id: int, task_id: str) -> None:
