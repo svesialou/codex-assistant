@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from codex_telegram_bot.config import Config
@@ -14,6 +15,7 @@ from codex_telegram_bot.services.llm_provider import (
 from codex_telegram_bot.services.llm_router import LlmTierAdvisor
 from codex_telegram_bot.services.model_router import ModelRouter
 from codex_telegram_bot.services.router_policy import RouterPolicy
+from codex_telegram_bot.services.task_similarity import TaskSimilarity
 from codex_telegram_bot.task_store import TaskRecord
 
 
@@ -45,6 +47,15 @@ class FailingProvider:
 
 def advisor_replying(text: str) -> LlmTierAdvisor:
     return LlmTierAdvisor(MockProvider([LlmResponse(text=text)]), model="haiku", timeout_seconds=45)
+
+
+def routed_payload(task_id: str, prompt: str, tier: str, outcome: str) -> dict:
+    return {
+        "id": task_id,
+        "prompt": prompt,
+        "phase": "completed",
+        "model_routing": {"selected_tier": tier, "manual_tier": "auto", "outcome": outcome},
+    }
 
 
 def task(prompt: str) -> TaskRecord:
@@ -145,11 +156,11 @@ class ModelRouterTest(unittest.TestCase):
         self.assertEqual(decision.classification.recommended_codex_tier, "strong")
         self.assertEqual(decision.policy_source, "llm-explicit")
 
-    def test_llm_tier_is_floor_for_medium_tasks_against_learned_stats(self) -> None:
+    def test_proven_stats_move_medium_task_one_step_below_llm_tier(self) -> None:
         advice = '{"tier": "strong", "explicit_user_request": false, "reason": "needs care"}'
         long_feature = "Добавь feature для фильтра списка. " + "Детали задачи. " * 30
         with tempfile.TemporaryDirectory() as tmp:
-            policy = RouterPolicy(Path(tmp) / "stats.json")
+            policy = RouterPolicy(Path(tmp) / "stats.json", explore_rate=0.0)
             for _ in range(6):
                 policy.record("medium", "demo", "cheap", True, save=False)
             router = ModelRouter(
@@ -160,8 +171,105 @@ class ModelRouterTest(unittest.TestCase):
             decision = router.route(task(long_feature))
 
         self.assertEqual(decision.classification.complexity, "medium")
+        # Proven cheap is not trusted two steps below the LLM tier.
+        self.assertEqual(decision.classification.recommended_codex_tier, "standard")
+        self.assertEqual(decision.policy_source, "learned")
+        self.assertEqual(decision.verify_mode, "full")
+
+    def test_llm_tier_is_floor_for_large_tasks_against_learned_stats(self) -> None:
+        advice = '{"tier": "strong", "explicit_user_request": false, "reason": "cross-service"}'
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = RouterPolicy(Path(tmp) / "stats.json", explore_rate=0.0)
+            for _ in range(10):
+                policy.record("large", "demo", "standard", True, save=False)
+            router = ModelRouter(
+                config_for(tmp),
+                policy=policy,
+                advisor=advisor_replying(advice),
+            )
+            decision = router.route(task("Сделай миграцию схемы и grpc api"))
+
+        self.assertEqual(decision.classification.complexity, "large")
         self.assertEqual(decision.classification.recommended_codex_tier, "strong")
-        self.assertEqual(decision.policy_source, "llm")
+
+    def test_similar_past_successes_pick_cheaper_tier(self) -> None:
+        details = " Детали задачи и пожелания по интерфейсу." * 8
+        past = [
+            routed_payload(f"past-{index}", "Добавь feature: фильтр списка задач." + details, "cheap", "success")
+            for index in range(3)
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = RouterPolicy(Path(tmp) / "stats.json", explore_rate=0.0)
+            router = ModelRouter(
+                config_for(tmp),
+                policy=policy,
+                similarity=TaskSimilarity(lambda: past),
+            )
+            decision = router.route(task("Добавь feature: фильтры списка задач." + details))
+            unrelated = ModelRouter(
+                config_for(tmp),
+                policy=policy,
+                similarity=TaskSimilarity(lambda: past),
+            ).route(task("Сделай выгрузку отчёта о платежах в CSV. " + "Колонки и формат. " * 20))
+
+        self.assertEqual(decision.classification.complexity, "medium")
+        self.assertEqual(decision.classification.recommended_codex_tier, "cheap")
+        self.assertEqual(decision.policy_source, "similar")
+        # Cheaper than the rule tier, so the run must be reviewed before it counts.
+        self.assertEqual(decision.verify_mode, "full")
+        self.assertNotEqual(unrelated.policy_source, "similar")
+
+    def test_similar_task_corrected_by_user_counts_as_failure(self) -> None:
+        corrected = routed_payload("past-1", "Поправь фильтр списка задач", "cheap", "success")
+        corrected["model_routing"]["feedback"] = {"label": "correction", "applied": True}
+        similar = TaskSimilarity(
+            lambda: [
+                corrected,
+                routed_payload("past-2", "Поправь фильтр списка задач", "cheap", "success"),
+            ]
+        ).similar("Поправь фильтры списка задач")
+
+        self.assertEqual(similar.per_tier(), {"cheap": (1, 2)})
+
+    def test_corrected_parent_tier_is_floor_for_the_fix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = RouterPolicy(Path(tmp) / "stats.json", explore_rate=0.0)
+            for _ in range(10):
+                policy.record("small", "demo", "cheap", True, save=False)
+            router = ModelRouter(config_for(tmp), policy=policy)
+            fix = task("Поправь баг, кнопка всё ещё не работает")
+            fix.model_routing = {"floor_tier": "standard"}
+            decision = router.route(fix)
+
+        self.assertEqual(decision.classification.recommended_codex_tier, "standard")
+        self.assertEqual(decision.policy_source, "feedback")
+
+    def test_planning_uses_sonnet_unless_work_is_large(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            router = ModelRouter(config_for(tmp, task_provider="claude"), policy=None)
+            small = router.planning_model(task("Почини баг в парсере"), "claude")
+            large = router.planning_model(task("Поменяй grpc api оркестратора"), "claude")
+
+        self.assertEqual((small, large), ("sonnet", "opus"))
+
+    def test_critic_and_sampled_review_apply_to_strong_runs_too(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config = replace(
+                config_for(tmp),
+                router_critic_min_complexity="medium",
+                router_verify_sample_rate=1.0,
+            )
+            router = ModelRouter(config, policy=None)
+            medium = router.route(task("Добавь feature для фильтра. " + "Детали. " * 40))
+            small = router.route(task("Почини баг в парсере"))
+            manual = router.route(task("Почини баг в парсере"), manual_tier="strong")
+
+        self.assertTrue(medium.critic_review)
+        self.assertEqual(medium.verify_mode, "full")
+        self.assertFalse(small.critic_review)
+        self.assertEqual(small.verify_mode, "full")
+        # Sampling only measures auto-routed tiers.
+        self.assertFalse(manual.verify_sampled)
 
 
 if __name__ == "__main__":

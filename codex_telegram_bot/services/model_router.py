@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import re
+import zlib
 from dataclasses import asdict, dataclass, field, replace
 from typing import Any
 
@@ -17,6 +18,7 @@ from .router_policy import (
     RouterPolicy,
     next_tier,
 )
+from .task_similarity import SimilarRuns, TaskSimilarity
 
 
 LOG = logging.getLogger("codex_telegram_bot")
@@ -24,6 +26,9 @@ COMPLEXITIES = ("trivial", "small", "medium", "large", "critical")
 COMPLEXITY_RANK = {complexity: index for index, complexity in enumerate(COMPLEXITIES)}
 TIERS = ("cheap", "standard", "strong", "max")
 TIER_RANK = {tier: index for index, tier in enumerate(TIERS)}
+# Similar past tasks may pick a cheaper tier when it succeeded on all of
+# at least this many neighbours.
+SIMILAR_MIN_RUNS = 3
 
 TRIVIAL_RE = re.compile(
     r"\b(typo|опечат|copy|copywriting|readme|css|текст|текста|"
@@ -83,10 +88,24 @@ class RoutingDecision:
     policy_reason: str = ""
     # Tier the regex rule recommended before the learned policy moved it.
     rule_tier: str = ""
+    # Critic review for complex work, sampled review for the rest: every tier
+    # gets the same reviewed success signal, not only the cheap ones.
+    critic_review: bool = False
+    verify_sampled: bool = False
+    # "light" for read-only runs that have no diff to review.
+    verify_override: str = ""
+    # Lowest tier allowed after a user correction of the parent run.
+    floor_tier: str = ""
 
     @property
     def verify_mode(self) -> str:
-        if self.classification.estimated_risk == "high":
+        if self.verify_override:
+            return self.verify_override
+        if (
+            self.classification.estimated_risk == "high"
+            or self.critic_review
+            or self.verify_sampled
+        ):
             return "full"
         tier = self.classification.recommended_codex_tier
         if self.rule_tier and TIER_RANK[tier] < TIER_RANK[self.rule_tier]:
@@ -110,13 +129,16 @@ class ModelRouter:
         config: Config,
         policy: RouterPolicy | None = None,
         advisor: LlmTierAdvisor | None = None,
+        similarity: TaskSimilarity | None = None,
     ) -> None:
         self.config = config
         self.policy = policy
         self.advisor = advisor
+        self.similarity = similarity
         # route() runs several times per task (orchestrator, fallback, /routing);
-        # the advisor is asked once per task id.
+        # the advisor and the kNN index are asked once per task id.
         self._advice_cache: dict[str, TierAdvice | None] = {}
+        self._similar_cache: dict[str, SimilarRuns] = {}
 
     def classify(self, task: TaskRecord) -> TaskClassification:
         text = " ".join(
@@ -153,8 +175,8 @@ class ModelRouter:
                 requires_reviewer=True,
                 requires_debate=self.config.orchestrator_debate,
                 recommended_codex_tier="strong",
-                recommended_claude_architect_tier="strong",
-                recommended_claude_reviewer_tier="strong",
+                recommended_claude_architect_tier="standard",
+                recommended_claude_reviewer_tier="standard",
                 max_review_rounds=min(2, self.config.orchestrator_max_review_rounds),
                 estimated_risk="high",
             )
@@ -208,8 +230,8 @@ class ModelRouter:
             requires_reviewer=True,
             requires_debate=self.config.orchestrator_debate,
             recommended_codex_tier="strong",
-            recommended_claude_architect_tier="strong",
-            recommended_claude_reviewer_tier="strong",
+            recommended_claude_architect_tier="standard",
+            recommended_claude_reviewer_tier="standard",
             max_review_rounds=min(2, self.config.orchestrator_max_review_rounds),
             estimated_risk="high",
         )
@@ -258,6 +280,9 @@ class ModelRouter:
             routed = replace_complexity(routed, "small", "standard")
             escalations.append("attachments make trivial task small")
 
+        floor_tier = str(task.model_routing.get("floor_tier") or "")
+        if floor_tier not in TIER_RANK:
+            floor_tier = ""
         if tier == "auto" and advice is not None and advice.explicit_user_request:
             # The user named the model: learned/explore must not move it.
             policy_source = "llm-explicit"
@@ -270,17 +295,23 @@ class ModelRouter:
                 routed.recommended_codex_tier,
                 self.auto_tier_ceiling(),
             )
-            if (
-                advice is not None
-                and COMPLEXITY_RANK[routed.complexity] >= COMPLEXITY_RANK["medium"]
-                and TIER_RANK[choice.tier] < TIER_RANK[rule_tier]
-            ):
-                # For medium+ tasks the LLM tier is a floor for stats and explore.
+            if choice.tier == rule_tier:
+                choice = self.similar_choice(task, routed.complexity, choice)
+            llm_floor = self.llm_floor(routed.complexity, rule_tier) if advice is not None else None
+            if llm_floor is not None and TIER_RANK[choice.tier] < TIER_RANK[llm_floor]:
                 choice = PolicyChoice(
-                    tier=rule_tier,
-                    effort=TIER_EFFORT[rule_tier],
-                    source="rule",
-                    reason=f"kept at LLM tier {rule_tier}",
+                    tier=llm_floor,
+                    effort=TIER_EFFORT[llm_floor],
+                    source="rule" if llm_floor == rule_tier else "learned",
+                    reason=f"kept near LLM tier {rule_tier}",
+                )
+            if floor_tier and TIER_RANK[choice.tier] < TIER_RANK[floor_tier]:
+                target = min(floor_tier, self.auto_tier_ceiling(), key=TIER_RANK.get)
+                choice = PolicyChoice(
+                    tier=target,
+                    effort=TIER_EFFORT[target],
+                    source="feedback",
+                    reason=f"user corrected a {floor_tier} run",
                 )
             routed = replace_codex_tier(routed, choice.tier)
             policy_source = choice.source
@@ -336,7 +367,80 @@ class ModelRouter:
             policy_source=policy_source,
             policy_reason=policy_reason,
             rule_tier=rule_tier,
+            critic_review=self.critic_review_for(routed.complexity),
+            verify_sampled=(
+                tier == "auto"
+                and stable_fraction(task.id) < self.config.router_verify_sample_rate
+            ),
+            floor_tier=floor_tier,
         )
+
+    def critic_review_for(self, complexity: str) -> bool:
+        minimum = self.config.router_critic_min_complexity
+        if minimum not in COMPLEXITY_RANK:
+            return False
+        return COMPLEXITY_RANK[complexity] >= COMPLEXITY_RANK[minimum]
+
+    @staticmethod
+    def llm_floor(complexity: str, llm_tier: str) -> str | None:
+        """How far stats may move below the LLM tier.
+
+        Large+ work keeps the LLM tier; medium work may go one step cheaper
+        on proven stats; small work follows the stats.
+        """
+        if COMPLEXITY_RANK[complexity] >= COMPLEXITY_RANK["large"]:
+            return llm_tier
+        if complexity == "medium":
+            return TIERS[max(0, TIER_RANK[llm_tier] - 1)]
+        return None
+
+    def similar_runs(self, task: TaskRecord) -> SimilarRuns:
+        if self.similarity is None:
+            return SimilarRuns()
+        if task.id not in self._similar_cache:
+            try:
+                self._similar_cache[task.id] = self.similarity.similar(task.prompt, task.id)
+            except Exception:  # noqa: BLE001 - a broken history record must not block routing
+                LOG.exception("similar task lookup failed for task %s", task.id)
+                self._similar_cache[task.id] = SimilarRuns()
+        return self._similar_cache[task.id]
+
+    def similar_choice(
+        self,
+        task: TaskRecord,
+        complexity: str,
+        choice: PolicyChoice,
+    ) -> PolicyChoice:
+        """A cheaper tier that solved every similar past task it was tried on."""
+        floor = RISK_FLOOR.get(complexity, "cheap")
+        per_tier = self.similar_runs(task).per_tier()
+        for tier in TIERS:
+            if TIER_RANK[tier] >= TIER_RANK[choice.tier] or TIER_RANK[tier] < TIER_RANK[floor]:
+                continue
+            ok, total = per_tier.get(tier, (0, 0))
+            if total >= SIMILAR_MIN_RUNS and ok == total:
+                return PolicyChoice(
+                    tier=tier,
+                    effort=TIER_EFFORT[tier],
+                    source="similar",
+                    reason=f"{tier} solved {ok}/{total} similar tasks",
+                )
+        return choice
+
+    def planning_model(self, task: TaskRecord, provider: str) -> str | None:
+        """Read-only planning: sonnet unless the work is large or critical."""
+        if self.config.orchestrator_model_routing != "auto" or not self.config.router_learning:
+            return None
+        classification = self.classify(task)
+        tier = (
+            "strong"
+            if COMPLEXITY_RANK[classification.complexity] >= COMPLEXITY_RANK["large"]
+            else "standard"
+        )
+        advice = self.advice_for(task, classification)
+        if advice is not None and advice.explicit_user_request:
+            tier = advice.tier
+        return self.executor_model(normalize_task_provider(provider), tier)
 
     def advice_for(self, task: TaskRecord, classification: TaskClassification) -> TierAdvice | None:
         if self.advisor is None:
@@ -361,6 +465,7 @@ class ModelRouter:
                 classification.complexity,
                 classification.recommended_codex_tier,
                 stats,
+                similar=self.similar_runs(task).render(),
             )
         except (LlmProviderUnavailable, ValueError) as exc:
             LOG.warning("LLM tier advice failed for task %s, using rules: %s", task.id, exc)
@@ -428,6 +533,11 @@ class ModelRouter:
         if major_review_issues:
             triggers.append("reviewer_found_major_or_critical_issues")
         return triggers
+
+
+def stable_fraction(value: str) -> float:
+    """Deterministic [0, 1) per task id, so re-routing keeps the same sample."""
+    return (zlib.crc32(value.encode("utf-8")) % 10000) / 10000
 
 
 def normalize_manual_tier(value: str | None) -> str | None:

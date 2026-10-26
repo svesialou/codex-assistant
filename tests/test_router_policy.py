@@ -69,6 +69,83 @@ class RouterPolicyTest(unittest.TestCase):
 
         self.assertEqual((choice.tier, choice.source), ("standard", "learned"))
 
+    def test_one_failure_in_few_runs_does_not_flip_to_stronger_tier(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = policy_at(tmp)
+            record_many(policy, "small", "standard", ok=6, failed=1)
+            record_many(policy, "small", "cheap", ok=12, failed=3)
+            standard = policy.choose("small", "demo", "standard", "strong")
+            cheap = policy.choose("small", "demo", "cheap", "strong")
+
+        self.assertEqual((standard.tier, standard.source), ("standard", "rule"))
+        self.assertEqual((cheap.tier, cheap.source), ("cheap", "rule"))
+
+    def test_proven_cheap_tier_beats_reliable_strong_on_utility(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = policy_at(tmp)
+            record_many(policy, "small", "strong", ok=20)
+            record_many(policy, "small", "cheap", ok=43, failed=4)
+            choice = policy.choose("small", "demo", "strong", "strong")
+
+        self.assertEqual((choice.tier, choice.source), ("cheap", "learned"))
+
+    def test_user_correction_turns_counted_success_into_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = policy_at(tmp)
+            record_many(policy, "small", "cheap", ok=5)
+            policy.record_feedback("small", "demo", "cheap", counted_success=True)
+            reloaded = RouterPolicy(Path(tmp) / "router-stats.json", explore_rate=0.0)
+            arm = reloaded.global_stats()["small"]["cheap"]
+            choice = reloaded.choose("small", "demo", "standard", "strong")
+
+        self.assertEqual((arm.runs, arm.successes, arm.corrections), (5, 4, 1))
+        # 4/5 is no longer proven, so the cheaper tier is not picked.
+        self.assertEqual(choice.tier, "standard")
+
+    def test_v1_stats_cap_seeded_strong_runs_and_keep_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "router-stats.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "buckets": {
+                            "small|*": {
+                                "strong": {"runs": 1453, "successes": 1443, "priced_runs": 1000,
+                                           "cost_usd": 1580.0},
+                                "cheap": {"runs": 47, "successes": 43},
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            policy = RouterPolicy(path)
+            arms = policy.global_stats()["small"]
+            backup_exists = path.with_name("router-stats.json.v1.bak").exists()
+            policy.save()
+            version = json.loads(path.read_text(encoding="utf-8"))["version"]
+
+        self.assertEqual((arms["strong"].runs, arms["strong"].successes), (20, 20))
+        self.assertAlmostEqual(arms["strong"].avg_cost(), 1.58, places=1)
+        self.assertEqual((arms["cheap"].runs, arms["cheap"].successes), (47, 43))
+        self.assertTrue(backup_exists)
+        self.assertEqual(version, 2)
+
+    def test_critic_overkill_verdicts_raise_exploration(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            policy = policy_at(tmp, explore=0.2)
+            record_many(policy, "medium", "strong", ok=6)
+            before = policy.choose("medium", "demo", "strong", "strong")
+            for _ in range(2):
+                policy.record_feedback(
+                    "medium", "demo", "strong", counted_success=True, correction=False, overkill=True
+                )
+            after = policy.choose("medium", "demo", "strong", "strong")
+
+        self.assertEqual(before.tier, "strong")
+        self.assertEqual((after.tier, after.source), ("standard", "explore"))
+
     def test_risk_floor_blocks_cheap_tier_for_critical_work(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             policy = policy_at(tmp, explore=0.0)

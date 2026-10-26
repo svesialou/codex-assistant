@@ -247,6 +247,12 @@ class Config:
     router_llm: bool = False
     router_llm_model: str = "haiku"
     router_llm_timeout_seconds: int = 45
+    # Critic-reviewed verify from this complexity up ("off" disables); review
+    # sample rate for the rest. Off in direct Config() so tests never call a model.
+    router_critic_min_complexity: str = "off"
+    router_verify_sample_rate: float = 0.0
+    # Learn from "continue + fix this" follow-ups (needs router_llm).
+    router_feedback: bool = True
     task_provider: str = DEFAULT_TASK_PROVIDER
     claude_enabled: bool = True
     claude_command: str | None = None
@@ -420,6 +426,14 @@ class Config:
                 1,
                 int(env.get("CODEX_ROUTER_LLM_TIMEOUT_SECONDS", "45")),
             ),
+            router_critic_min_complexity=(
+                env.get("CODEX_ROUTER_CRITIC_MIN_COMPLEXITY", "medium").strip().lower() or "off"
+            ),
+            router_verify_sample_rate=min(
+                1.0,
+                max(0.0, float(env.get("CODEX_ROUTER_VERIFY_SAMPLE_RATE", "0.2"))),
+            ),
+            router_feedback=parse_bool(env.get("CODEX_ROUTER_FEEDBACK"), True),
             task_provider=normalize_task_provider(
                 env.get("CODEX_TELEGRAM_TASK_PROVIDER")
                 or env.get("CODEX_TASK_PROVIDER"),
