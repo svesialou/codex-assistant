@@ -234,6 +234,23 @@ class OrchestratorService:
         )
         return task
 
+    def run_delegated(
+        self,
+        task: TaskRecord,
+        project: ProjectInfo,
+        notify: Callable[[str], None] | None = None,
+        append_event: Callable[..., None] | None = None,
+    ) -> TaskRecord:
+        """Planner -> executor (dispatcher) -> critic, workers as separate processes.
+
+        Has no fallback to the classic router: a failed stage stops the task.
+        """
+        from .delegation import DelegationService
+
+        return DelegationService(self.config, self.store).run(
+            task, project, notify=notify, append_event=append_event
+        )
+
     def _kind_log_path(self, task: TaskRecord, kind: str) -> Path:
         name = "agent.log" if kind == KIND_AGENT_CHAT else "run.log"
         return self.store.task_dir(task.id) / name

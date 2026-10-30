@@ -3849,7 +3849,18 @@ class CodexTelegramBot:
             message_id=status_message_id,
         )
         orchestrator_enabled = self.effective_orchestrator_mode(task.chat_id)
-        if orchestrator_enabled:
+        if self.config.orchestrator_mode == "delegate":
+            task = self.orchestrator.run_delegated(
+                task,
+                project,
+                notify=lambda text: self.send(
+                    task.chat_id,
+                    text,
+                    reply_markup=running_task_keyboard(task.id),
+                ),
+                append_event=self.append_event,
+            )
+        elif orchestrator_enabled:
             task = self.orchestrator.execute(
                 task,
                 project,

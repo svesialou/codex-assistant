@@ -17,3 +17,6 @@ codex-linear = "codex_telegram_bot.linear:main"
 
 [tool.setuptools]
 packages = ["codex_telegram_bot", "codex_telegram_bot.services"]
+
+[tool.setuptools.package-data]
+"codex_telegram_bot.services" = ["delegation_prompts/*.md"]

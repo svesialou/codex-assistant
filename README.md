@@ -477,3 +477,21 @@ runtime it must be mounted into the container.
 
 The main menu is task-first: `Tasks`, `Run custom`, `Settings`, and `Help`.
 Advanced project, memory, trace, and model controls live under settings or task cards.
+
+## Delegation mode
+
+Set `CODEX_ORCHESTRATOR_MODE=delegate` in `~/.codex/secrets/telegram.env` to run every
+task through three independent `claude -p` processes instead of the tier router:
+
+- Planner (opus, medium, read-only) writes a JSON plan of atomic subtasks.
+- Executor (opus, medium, no Edit/Write/Bash/Agent tools) dispatches subtasks and writes worker briefs.
+- Workers run as separate processes: `coder` on sonnet, `researcher` on haiku.
+- Critic (opus, medium, no edit tools) re-checks the real diff; `request_changes` sends fix subtasks back through the executor.
+
+Role prompts live in `codex_telegram_bot/services/delegation_prompts/`. Per-task state and
+logs are in `~/.codex/telegram-bot/tasks/<id>/delegation/`. There is no fallback to the
+classic router: a failed stage ends the task. Optional settings:
+`CODEX_DELEGATE_LEAD_MODEL`, `CODEX_DELEGATE_LEAD_EFFORT`, `CODEX_DELEGATE_CODER_MODEL`,
+`CODEX_DELEGATE_RESEARCHER_MODEL`, `CODEX_DELEGATE_MAX_SUBTASKS` (12),
+`CODEX_DELEGATE_MAX_PARALLEL` (3), `CODEX_DELEGATE_MAX_CRITIC_ROUNDS` (2),
+`CODEX_DELEGATE_PROCESS_TIMEOUT_SECONDS` (1800). The default is `classic`.

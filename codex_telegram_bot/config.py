@@ -135,6 +135,16 @@ DEFAULT_CLAUDE_READONLY_COMMAND = (
 DEFAULT_CLAUDE_VERIFY_COMMAND = "claude -p --permission-mode plan --model {model}"
 
 
+ORCHESTRATOR_MODES = ("classic", "delegate")
+
+
+def normalize_orchestrator_mode(value: str | None) -> str:
+    mode = (value or "classic").strip().lower() or "classic"
+    if mode not in ORCHESTRATOR_MODES:
+        raise ValueError(f"Invalid orchestrator mode: {value}")
+    return mode
+
+
 def normalize_task_provider(
     value: str | None,
     default: str = DEFAULT_TASK_PROVIDER,
@@ -253,6 +263,17 @@ class Config:
     router_verify_sample_rate: float = 0.0
     # Learn from "continue + fix this" follow-ups (needs router_llm).
     router_feedback: bool = True
+    # "classic" keeps the tier router; "delegate" runs planner -> executor -> critic
+    # as separate processes and hands all implementation to worker agents.
+    orchestrator_mode: str = "classic"
+    delegate_lead_model: str = "opus"
+    delegate_lead_effort: str = "medium"
+    delegate_coder_model: str = "sonnet"
+    delegate_researcher_model: str = "haiku"
+    delegate_max_subtasks: int = 12
+    delegate_max_parallel: int = 3
+    delegate_max_critic_rounds: int = 2
+    delegate_process_timeout_seconds: int = 1800
     task_provider: str = DEFAULT_TASK_PROVIDER
     claude_enabled: bool = True
     claude_command: str | None = None
@@ -438,6 +459,27 @@ class Config:
                 env.get("CODEX_TELEGRAM_TASK_PROVIDER")
                 or env.get("CODEX_TASK_PROVIDER"),
                 DEFAULT_TASK_PROVIDER,
+            ),
+            orchestrator_mode=normalize_orchestrator_mode(env.get("CODEX_ORCHESTRATOR_MODE")),
+            delegate_lead_model=env.get("CODEX_DELEGATE_LEAD_MODEL", "opus").strip() or "opus",
+            delegate_lead_effort=(
+                env.get("CODEX_DELEGATE_LEAD_EFFORT", "medium").strip() or "medium"
+            ),
+            delegate_coder_model=(
+                env.get("CODEX_DELEGATE_CODER_MODEL", "sonnet").strip() or "sonnet"
+            ),
+            delegate_researcher_model=(
+                env.get("CODEX_DELEGATE_RESEARCHER_MODEL", "haiku").strip() or "haiku"
+            ),
+            delegate_max_subtasks=max(1, int(env.get("CODEX_DELEGATE_MAX_SUBTASKS", "12"))),
+            delegate_max_parallel=max(1, int(env.get("CODEX_DELEGATE_MAX_PARALLEL", "3"))),
+            delegate_max_critic_rounds=max(
+                1,
+                int(env.get("CODEX_DELEGATE_MAX_CRITIC_ROUNDS", "2")),
+            ),
+            delegate_process_timeout_seconds=max(
+                1,
+                int(env.get("CODEX_DELEGATE_PROCESS_TIMEOUT_SECONDS", "1800")),
             ),
             claude_enabled=parse_bool(env.get("CODEX_CLAUDE_ENABLED"), True),
             claude_command=(
